@@ -97,7 +97,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable kubelet
 
 # Install additional tools for development and checkpointing
-sudo apt-get install -y git make wget curl tree jq criu runc
+sudo apt-get install -y git make wget curl tree jq criu runc nfs-common
 
 # Install Go for building the controller
 ARCH=$(dpkg --print-architecture)

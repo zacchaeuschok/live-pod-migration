@@ -90,6 +90,26 @@ sudo -u vagrant bash -c 'echo "export GOPATH=\$HOME/go" >> $HOME/.bashrc'
 sudo -u vagrant bash -c 'echo "export PATH=\$PATH:\$GOPATH/bin" >> $HOME/.bashrc'
 sudo -u vagrant bash -c 'export GOPATH=$HOME/go && export PATH=$PATH:$GOPATH/bin && cd $HOME/live-pod-migration-controller && go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest && mkdir -p bin && cp $(go env GOPATH)/bin/controller-gen bin/ && go install sigs.k8s.io/kustomize/kustomize/v5@latest && cp $(go env GOPATH)/bin/kustomize bin/'
 
+# Install NFS server for shared storage
+echo "Installing NFS server for shared storage..."
+sudo apt-get install -y nfs-kernel-server
+
+# Create shared directory
+sudo mkdir -p /var/nfs/checkpoint-storage
+sudo chown nobody:nogroup /var/nfs/checkpoint-storage
+sudo chmod 777 /var/nfs/checkpoint-storage
+
+# Configure NFS exports
+echo "/var/nfs/checkpoint-storage *(rw,sync,no_subtree_check,no_root_squash)" | sudo tee /etc/exports
+
+# Start and enable NFS services
+sudo systemctl restart nfs-kernel-server
+sudo systemctl enable nfs-kernel-server
+
+# Verify NFS is working
+sudo exportfs -ra
+sudo exportfs -v
+
 # Test checkpoint API functionality
 echo "Testing checkpoint API functionality..."
 sudo curl -X POST -k --cert /etc/kubernetes/pki/apiserver-kubelet-client.crt \
@@ -98,4 +118,5 @@ sudo curl -X POST -k --cert /etc/kubernetes/pki/apiserver-kubelet-client.crt \
 
 echo "Master node setup completed successfully!"
 echo "Checkpoint feature is enabled and ready for use."
+echo "NFS server is running for shared checkpoint storage."
 echo "You can now access the cluster with: kubectl get nodes"
