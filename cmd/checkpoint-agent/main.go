@@ -102,8 +102,22 @@ func (s *CheckpointServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 		}, nil
 	}
 
-	// Return the first checkpoint file as the artifact URI
-	artifactURI := fmt.Sprintf("file://%s", checkpointFiles[0])
+	// Copy checkpoint to shared storage
+	sharedPath, err := s.copyToSharedStorage(req.PodUid, req.ContainerName, checkpointFiles[0])
+	if err != nil {
+		log.Printf("Failed to copy to shared storage: %v", err)
+		// Return local path as fallback
+		artifactURI := fmt.Sprintf("file://%s", checkpointFiles[0])
+		log.Printf("Checkpoint created successfully: %s", artifactURI)
+		return &pb.CheckpointResponse{
+			Success:     true,
+			ArtifactUri: artifactURI,
+			Message:     "checkpoint created successfully",
+		}, nil
+	}
+
+	// Return shared path
+	artifactURI := fmt.Sprintf("shared://%s", sharedPath)
 	log.Printf("Checkpoint created successfully: %s", artifactURI)
 	return &pb.CheckpointResponse{
 		Success:     true,
@@ -312,4 +326,33 @@ func main() {
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
+}
+
+// copyToSharedStorage copies checkpoint to shared NFS mount
+func (s *CheckpointServer) copyToSharedStorage(podUID, containerName, localPath string) (string, error) {
+	// Simple path: /mnt/checkpoints/<podUID>-<container>-<timestamp>.tar
+	timestamp := time.Now().Format("20060102-150405")
+	filename := fmt.Sprintf("%s-%s-%s.tar", podUID, containerName, timestamp)
+	sharedPath := filepath.Join("/mnt/checkpoints", filename)
+	
+	// Copy file
+	sourceFile, err := os.Open(localPath)
+	if err != nil {
+		return "", err
+	}
+	defer sourceFile.Close()
+	
+	destFile, err := os.Create(sharedPath)
+	if err != nil {
+		return "", err
+	}
+	defer destFile.Close()
+	
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return "", err
+	}
+	
+	// Return relative path for shared:// URI
+	return filename, destFile.Sync()
 }
