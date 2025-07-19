@@ -1,0 +1,9 @@
+apiVersion: lpm.my.domain/v1
+kind: PodMigration
+metadata:
+  labels:
+    app.kubernetes.io/name: live-pod-migration-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: podmigration-sample
+spec:
+  # TODO(user): Add fields here

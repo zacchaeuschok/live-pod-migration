@@ -1,0 +1,8 @@
+## Append samples of your project ##
+resources:
+- lpm_v1_podmigration.yaml
+- lpm_v1_podcheckpoint.yaml
+- lpm_v1_podcheckpointcontent.yaml
+- lpm_v1_containercheckpoint.yaml
+- lpm_v1_containercheckpointcontent.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

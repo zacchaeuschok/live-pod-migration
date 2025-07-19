@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- serviceaccount.yaml
+- rbac.yaml
+- service.yaml
+- daemonset.yaml
+
+namespace: live-pod-migration-controller-system
+
+namePrefix: live-pod-migration-controller-
+
+commonLabels:
+  app.kubernetes.io/name: checkpoint-agent
+  app.kubernetes.io/instance: live-pod-migration-controller
+  app.kubernetes.io/part-of: live-pod-migration-controller
+  app.kubernetes.io/managed-by: kustomize
