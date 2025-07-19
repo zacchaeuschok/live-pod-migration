@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: checkpoint-agent
+  namespace: system
+  labels:
+    app: checkpoint-agent
+    control-plane: checkpoint-agent
+spec:
+  selector:
+    matchLabels:
+      app: checkpoint-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: checkpoint-agent
+    spec:
+      serviceAccountName: checkpoint-agent
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      containers:
+        - name: agent
+          image: localhost/checkpoint-agent:latest
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+            runAsUser: 0
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - SYS_PTRACE
+                - SYS_CHROOT
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: grpc
+              containerPort: 50051
+              hostPort: 50051
+              protocol: TCP
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: cri-sock
+              mountPath: /var/run/crio/crio.sock
+            - name: checkpoints
+              mountPath: /var/lib/checkpoints
+            - name: sysfs
+              mountPath: /sys
+              readOnly: true
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: dev
+              mountPath: /dev
+            - name: run
+              mountPath: /run
+            - name: k8s-certs
+              mountPath: /etc/kubernetes/pki
+              readOnly: true
+            - name: kubelet-certs
+              mountPath: /var/lib/kubelet/pki
+              readOnly: true
+      volumes:
+        - name: cri-sock
+          hostPath:
+            path: /var/run/crio/crio.sock
+            type: Socket
+        - name: checkpoints
+          hostPath:
+            path: /var/lib/checkpoints
+            type: DirectoryOrCreate
+        - name: sysfs
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: run
+          hostPath:
+            path: /run
+            type: Directory
+        - name: k8s-certs
+          hostPath:
+            path: /etc/kubernetes/pki
+            type: Directory
+        - name: kubelet-certs
+          hostPath:
+            path: /var/lib/kubelet/pki
+            type: Directory

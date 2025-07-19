@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package checkpoint;
+
+option go_package = "my.domain/guestbook/api/proto";
+
+// CheckpointService provides container checkpoint and restore operations
+service CheckpointService {
+  // Checkpoint creates a checkpoint of a container
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  
+  // Restore restores a container from a checkpoint
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+  
+  // Health check for the service
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// CheckpointRequest contains the information needed to checkpoint a container
+message CheckpointRequest {
+  string pod_namespace = 1;
+  string pod_name = 2;
+  string container_name = 3;
+  string pod_uid = 4;
+}
+
+// CheckpointResponse contains the result of a checkpoint operation
+message CheckpointResponse {
+  bool success = 1;
+  string artifact_uri = 2;
+  string message = 3;
+  string error = 4;
+}
+
+// RestoreRequest contains the information needed to restore a container
+message RestoreRequest {
+  string artifact_uri = 1;
+  string pod_namespace = 2;
+  string pod_name = 3;
+  string container_name = 4;
+  string pod_uid = 5;
+}
+
+// RestoreResponse contains the result of a restore operation
+message RestoreResponse {
+  bool success = 1;
+  string message = 2;
+  string error = 3;
+}
+
+// HealthRequest for health checks
+message HealthRequest {}
+
+// HealthResponse for health checks
+message HealthResponse {
+  bool healthy = 1;
+  string message = 2;
+}

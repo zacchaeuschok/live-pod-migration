@@ -1,0 +1,10 @@
+apiVersion: lpm.my.domain/v1
+kind: PodCheckpoint
+metadata:
+  labels:
+    app.kubernetes.io/name: live-pod-migration-controller
+    app.kubernetes.io/instance: sample
+  name: test-pod-checkpoint
+  namespace: default
+spec:
+  podName: test-pod

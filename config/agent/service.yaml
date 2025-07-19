@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkpoint-agent
+  namespace: system
+  labels:
+    app: checkpoint-agent
+spec:
+  clusterIP: None
+  selector:
+    app: checkpoint-agent
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+      protocol: TCP

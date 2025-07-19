@@ -1,0 +1,63 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-22.04"
+  
+  # Explicitly configure the /vagrant shared folder with rsync
+  config.vm.synced_folder ".", "/vagrant", type: "rsync", rsync__auto: true
+  
+  # Sync the live-pod-migration-controller directory
+  config.vm.synced_folder "..", "/home/vagrant/live-pod-migration-controller", type: "rsync", rsync__auto: true
+  
+  # Master node (control-plane)
+  config.vm.define "master" do |master|
+    master.vm.hostname = "k8s-master"
+    master.vm.network "private_network", ip: "192.168.56.10"
+    
+    master.vm.provider "virtualbox" do |vb|
+      vb.memory = "4096"
+      vb.cpus = 2
+      vb.name = "k8s-master"
+    end
+
+    master.vm.provider "parallels" do |prl|
+      prl.memory = 4096
+      prl.cpus = 2
+      prl.name = "k8s-master"
+    end
+
+    master.vm.provision "shell", path: "scripts/common.sh"
+    master.vm.provision "shell", path: "scripts/master.sh"
+  end
+
+  # Worker node
+  config.vm.define "worker" do |worker|
+    worker.vm.hostname = "k8s-worker"
+    worker.vm.network "private_network", ip: "192.168.56.11"
+    
+    worker.vm.provider "virtualbox" do |vb|
+      vb.memory = "2048"
+      vb.cpus = 2
+      vb.name = "k8s-worker"
+    end
+
+    worker.vm.provider "parallels" do |prl|
+      prl.memory = 2048
+      prl.cpus = 2
+      prl.name = "k8s-worker"
+    end
+
+    worker.vm.provision "shell", path: "scripts/common.sh"
+    
+    # Join cluster if setup.sh is present
+    worker.vm.provision "shell", inline: <<-SHELL
+      if [ -f /vagrant/setup.sh ]; then
+        echo "[worker] joining the cluster..."
+        bash /vagrant/setup.sh
+      else
+        echo "[worker] /vagrant/setup.sh not found - join manually."
+      fi
+    SHELL
+  end
+end
