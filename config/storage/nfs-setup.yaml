@@ -1,0 +1,78 @@
+# NFS Server Setup - Run these commands on the master node
+# This sets up a simple NFS server for checkpoint storage
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nfs-setup-script
+  namespace: kube-system
+data:
+  setup-nfs.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    echo "Setting up NFS server for checkpoint storage..."
+    
+    # Install NFS server
+    sudo apt-get update
+    sudo apt-get install -y nfs-kernel-server nfs-common
+    
+    # Create shared directory
+    sudo mkdir -p /var/nfs/checkpoint-storage
+    sudo chown nobody:nogroup /var/nfs/checkpoint-storage
+    sudo chmod 777 /var/nfs/checkpoint-storage
+    
+    # Configure NFS exports
+    echo "/var/nfs/checkpoint-storage *(rw,sync,no_subtree_check,no_root_squash)" | sudo tee -a /etc/exports
+    
+    # Restart NFS services
+    sudo systemctl restart nfs-kernel-server
+    sudo systemctl enable nfs-kernel-server
+    
+    # Verify NFS is running
+    sudo exportfs -ra
+    sudo exportfs -v
+    
+    echo "NFS server setup complete!"
+    echo "Export: /var/nfs/checkpoint-storage"
+    echo "Server IP: $(hostname -I | awk '{print $1}')"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nfs-setup
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: setup
+        image: ubuntu:22.04
+        command: ["/bin/bash"]
+        args: ["/scripts/setup-nfs.sh"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        - name: host-root
+          mountPath: /host
+          mountPropagation: Bidirectional
+      volumes:
+      - name: script
+        configMap:
+          name: nfs-setup-script
+          defaultMode: 0755
+      - name: host-root
+        hostPath:
+          path: /
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule

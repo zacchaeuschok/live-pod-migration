@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -165,7 +164,7 @@ func (r *ContainerCheckpointReconciler) handleCheckpointingPhase(ctx context.Con
 				return ctrl.Result{}, err
 			}
 
-			// Bind content and mark checkpoint as ready immediately  
+			// Bind content and mark checkpoint as ready immediately
 			now := metav1.Now()
 			containerCheckpoint.Status.BoundContentName = containerCheckpointContent.Name
 			containerCheckpoint.Status.Ready = true
@@ -215,7 +214,7 @@ func (r *ContainerCheckpointReconciler) performContainerCheckpoint(ctx context.C
 	}
 
 	// Call the agent to perform the container checkpoint operation
-	return r.Agent.CheckpointContainer(ctx, 
+	return r.Agent.CheckpointContainer(ctx,
 		pod.Spec.NodeName,
 		containerCheckpoint.Namespace,
 		containerCheckpoint.Spec.PodName,

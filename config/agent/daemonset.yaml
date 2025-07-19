@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: checkpoint-agent
-  namespace: system
+  namespace: live-pod-migration-controller-system
   labels:
     app: checkpoint-agent
     control-plane: checkpoint-agent
@@ -82,7 +82,9 @@ spec:
             - name: cri-sock
               mountPath: /var/run/crio/crio.sock
             - name: checkpoints
-              mountPath: /var/lib/checkpoints
+              mountPath: /var/lib/kubelet/checkpoints
+            - name: checkpoint-repo
+              mountPath: /mnt/checkpoints
             - name: sysfs
               mountPath: /sys
               readOnly: true
@@ -106,8 +108,11 @@ spec:
             type: Socket
         - name: checkpoints
           hostPath:
-            path: /var/lib/checkpoints
+            path: /var/lib/kubelet/checkpoints
             type: DirectoryOrCreate
+        - name: checkpoint-repo
+          persistentVolumeClaim:
+            claimName: checkpoint-repo
         - name: sysfs
           hostPath:
             path: /sys

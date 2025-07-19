@@ -23,9 +23,8 @@ COPY internal/agent/ internal/agent/
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o checkpoint-agent cmd/checkpoint-agent/main.go
 
-# Use distroless as minimal base image to package the checkpoint agent binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+# Use a minimal base image with basic shell tools for debugging and file operations
+FROM alpine:latest
 WORKDIR /
 COPY --from=builder /workspace/checkpoint-agent .
 USER 0:0

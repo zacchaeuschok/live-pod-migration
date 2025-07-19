@@ -35,6 +35,9 @@ sudo buildah push localhost/checkpoint-agent:latest oci:/var/lib/containers/stor
 
 # Deploy the system (includes CRDs, RBAC, controller, and agent DaemonSet)
 make deploy IMG=localhost/controller:latest AGENT_IMG=localhost/checkpoint-agent:latest
+
+# Deploy shared storage for cross-node checkpoint access
+./deploy-shared-storage.sh
 ```
 
 ### 2. Verify Deployment
@@ -147,7 +150,122 @@ kubectl describe podcheckpoint multi-container-checkpoint
 kubectl get podcheckpointcontent
 ```
 
-### 6. Verify Agent Operation
+### 6. Verify Shared Storage
+
+```bash
+# Check shared storage is working
+kubectl get pvc -n live-pod-migration-controller-system
+
+# Verify NFS provisioner is running
+kubectl get pods -n kube-system -l app=nfs-subdir-external-provisioner
+
+# Check agent pods have shared storage mounted
+kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].spec.volumes[?(@.name=="checkpoint-repo")].persistentVolumeClaim.claimName}'
+
+# Test checkpoint files are saved to shared storage
+kubectl exec -n live-pod-migration-controller-system $(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].metadata.name}') -- ls -la /mnt/checkpoints/
+```
+
+### 7. Test Live Pod Migration
+
+```bash
+# Create a test pod with some state - scheduled on master node
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stateful-pod
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: k8s-master
+  containers:
+  - name: nginx
+    image: docker.io/library/nginx:1.21
+    ports:
+    - containerPort: 80
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  - name: writer
+    image: docker.io/library/busybox:1.35
+    command: ['sh', '-c', 'while true; do echo "$(date): Hello from $(hostname)" >> /data/log.txt; sleep 2; done']
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    emptyDir: {}
+EOF
+
+# Wait for pod to be running and accumulate some state
+kubectl wait --for=condition=Ready pod/stateful-pod --timeout=60s
+sleep 10
+
+# Verify pod is running on master node
+kubectl get pod stateful-pod -o wide
+
+# Check the data being written to verify state
+kubectl exec stateful-pod -c writer -- tail -5 /data/log.txt
+
+# Create a PodMigration to migrate from master to worker
+kubectl apply -f - <<EOF
+apiVersion: lpm.my.domain/v1
+kind: PodMigration
+metadata:
+  name: migrate-master-to-worker
+  namespace: default
+spec:
+  podName: stateful-pod
+  targetNode: k8s-worker
+EOF
+
+# Watch the migration progress
+kubectl get podmigration migrate-master-to-worker -w
+
+# Verify checkpoint was created in shared storage
+kubectl get podcheckpoint
+kubectl get containercheckpoint
+
+# Check checkpoint files are in shared storage (accessible from any node)
+kubectl exec -n live-pod-migration-controller-system $(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].metadata.name}') -- ls -la /mnt/checkpoints/
+
+# Verify the checkpoint content URIs use shared:// prefix
+kubectl get containercheckpointcontent -o jsonpath='{.items[*].spec.artifactURI}' | tr ' ' '\n' | grep shared://
+
+# After migration completes, verify pod moved to worker node
+kubectl get pod stateful-pod -o wide
+
+# Verify state was preserved by checking the log file
+kubectl exec stateful-pod -c writer -- tail -10 /data/log.txt
+
+# Check that timestamps show continuity (no major gaps indicating successful state preservation)
+```
+
+### 8. Verify Cross-Node Checkpoint Access
+
+```bash
+# Check which nodes have checkpoint agents
+kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o wide
+
+# Verify shared storage is accessible from all nodes
+for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  echo "=== Node: $node ==="
+  POD=$(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent --field-selector spec.nodeName=$node -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "$POD" ]; then
+    kubectl exec -n live-pod-migration-controller-system $POD -- ls -la /mnt/checkpoints/
+  else
+    echo "No agent on $node"
+  fi
+done
+
+# Test checkpoint file accessibility across nodes
+POD=$(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].metadata.name}')
+echo "Testing checkpoint file access across nodes:"
+kubectl exec -n live-pod-migration-controller-system $POD -- ls -la /mnt/checkpoints/
+```
+
+### 9. Verify Agent Operation
 
 ```bash
 # Check agent pods are running
@@ -158,6 +276,9 @@ kubectl logs -n live-pod-migration-controller-system -l app=checkpoint-agent
 
 # Check controller logs
 kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-manager
+
+# Check for checkpoint operations in logs
+kubectl logs -n live-pod-migration-controller-system -l app=checkpoint-agent | grep -i checkpoint
 ```
 
 ## Expected Behavior
@@ -170,7 +291,9 @@ kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-m
 
 2. **Agent** creates real checkpoint files at `/var/lib/kubelet/checkpoints/checkpoint-<pod>_<namespace>-<container>-<timestamp>.tar`
 
-3. **ContainerCheckpointContent** is automatically created with artifact URI
+3. **Shared Storage**: Checkpoint files are automatically copied to shared NFS storage at `/mnt/checkpoints/<podUID>-<container>-<timestamp>.tar`
+
+4. **ContainerCheckpointContent** is automatically created with artifact URI using `shared://` prefix for cross-node access
 
 ### PodCheckpoint Workflow  
 1. **PodCheckpoint** transitions through phases:
@@ -186,6 +309,25 @@ kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-m
    ```
 
 3. **Resource Naming**: Child resources use deterministic names like `<podcheckpoint-name>-<container-name>`
+
+### PodMigration Workflow
+1. **PodMigration** orchestrates the complete migration process:
+   - `Pending` → validates source pod exists and is running
+   - `CheckpointInProgress` → creates PodCheckpoint for the source pod
+   - `CheckpointCompleted` → waits for checkpoint to complete successfully
+   - `MigrationInProgress` → schedules pod on destination node (if specified)
+   - `RestoreInProgress` → restores pod from checkpoint on destination node
+   - `Succeeded` → migration completed, source pod terminated
+
+2. **Cross-Node Capability**: Checkpoint files stored in shared storage enable migration between any nodes in the cluster
+
+3. **Automatic Scheduling**: If no destination node specified, scheduler selects optimal target node
+
+### Shared Storage Behavior
+1. **NFS-based Storage**: Uses NFS subdir external provisioner for ReadWriteMany access
+2. **Checkpoint Files**: Accessible from all nodes at `/mnt/checkpoints/` 
+3. **Fallback Mechanism**: Falls back to local storage if shared storage unavailable
+4. **URI Format**: Shared files use `shared://<filename>` format, local files use `file://<path>` format
 
 ## Troubleshooting
 
@@ -408,8 +550,15 @@ sudo crictl rmi localhost/checkpoint-agent:latest localhost/controller:latest ||
 # 8. Clean up checkpoint files from kubelet directory
 sudo find /var/lib/kubelet/checkpoints/ -name "checkpoint-*.tar" -delete
 
-# 9. Optional: Clean up test pods
-kubectl delete pod test-pod multi-container-pod --ignore-not-found=true
+# 9. Clean up shared storage infrastructure
+kubectl delete -f config/storage/checkpoint-pvc.yaml --ignore-not-found=true
+kubectl delete -f config/storage/nfs-provisioner.yaml --ignore-not-found=true
+kubectl delete job/nfs-setup -n kube-system --ignore-not-found=true
+kubectl delete configmap/nfs-setup-script -n kube-system --ignore-not-found=true
+
+# 10. Optional: Clean up test pods and migrations
+kubectl delete pod test-pod multi-container-pod stateful-pod --ignore-not-found=true
+kubectl delete podmigration --all --all-namespaces --ignore-not-found=true
 ```
 
 After cleanup, you can follow the build and deploy steps again to start fresh.
