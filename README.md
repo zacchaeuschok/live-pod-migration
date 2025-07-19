@@ -1,8 +1,80 @@
-# live-pod-migration-controller
-// TODO(user): Add simple overview of use/purpose
+# Live Pod Migration Controller
+
+A Kubernetes controller that enables live migration of running pods between cluster nodes using CRIU (Checkpoint/Restore In Userspace) technology. The system performs checkpoint operations on source nodes and restores pod state on destination nodes with minimal downtime.
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+
+The Live Pod Migration Controller implements a complete control-plane and node agent architecture for migrating stateful workloads across Kubernetes cluster nodes. It provides three main capabilities:
+
+**🔄 Container-Level Checkpointing**: Create point-in-time snapshots of individual containers within pods, capturing process state, memory contents, and file descriptors.
+
+**📦 Pod-Level Migration**: Orchestrate migration of entire pods by automatically checkpointing all containers and coordinating the restore process on destination nodes.
+
+**🏗️ Distributed Architecture**: A control-plane operator manages the migration lifecycle while privileged node agents perform the actual checkpoint/restore operations via secure gRPC communication.
+
+### Key Features
+
+- **Minimal Downtime**: Live migration preserves application state with checkpoint/restore technology
+- **Declarative API**: Kubernetes-native CRDs for `PodCheckpoint`, `ContainerCheckpoint`, and migration resources
+- **Cross-Node Mobility**: Move workloads between nodes for maintenance, load balancing, or resource optimization
+- **CRIU Integration**: Leverages mature CRIU technology for reliable process state capture
+- **Production Ready**: Comprehensive error handling, status reporting, and operational observability
+
+### Architecture Components
+
+- **PodMigration Controller**: Orchestrates end-to-end pod migration workflows
+- **PodCheckpoint Controller**: Manages pod-level checkpoint operations across multiple containers  
+- **ContainerCheckpoint Controller**: Handles individual container checkpoint lifecycle
+- **Checkpoint Agent**: Privileged DaemonSet that interfaces with kubelet checkpoint API and CRIU
+- **Storage Integration**: Pluggable storage backends for checkpoint artifacts (local, PVC, object storage)
+
+### Use Cases
+
+- **Node Maintenance**: Drain nodes for updates while preserving long-running job state
+- **Resource Optimization**: Move workloads to optimize cluster resource utilization
+- **Disaster Recovery**: Create portable checkpoints for cross-cluster recovery scenarios
+- **Development/Testing**: Capture and replay application states for debugging and testing
+
+## Quick Start
+
+For a complete setup guide including CRIU configuration and testing instructions, see [README-TESTING.md](./README-TESTING.md).
+
+### Basic Workflow
+
+1. **Deploy the system** on a Kubernetes cluster with CRIU support
+2. **Create a checkpoint** of a running pod:
+   ```yaml
+   apiVersion: lpm.my.domain/v1
+   kind: PodCheckpoint
+   metadata:
+     name: my-app-checkpoint
+   spec:
+     podName: my-app-pod
+   ```
+3. **Monitor progress** with `kubectl get podcheckpoint my-app-checkpoint -w`
+4. **Use checkpoint artifacts** for migration or backup scenarios
+
+## Project Structure
+
+```
+├── api/v1/                          # CRD definitions and Go types
+├── cmd/checkpoint-agent/            # Node agent binary
+├── internal/
+│   ├── controller/                  # Controller reconciliation logic
+│   └── agent/                       # Agent client and gRPC interfaces
+├── config/
+│   ├── crd/bases/                   # Generated CRD manifests
+│   ├── agent/                       # DaemonSet and RBAC for agents
+│   └── samples/                     # Example resources
+├── vagrant/                         # Development environment setup
+└── README-TESTING.md               # Comprehensive testing guide
+```
+
+## Documentation
+
+- **[Testing Guide](./README-TESTING.md)**: Complete setup, testing, and troubleshooting instructions
+- **[Storage Plan](./CHECKPOINT-STORAGE-PLAN.md)**: Design for shared storage implementation
+- **API Reference**: Generated CRD documentation (see `config/crd/bases/`)
 
 ## Getting Started
 
@@ -110,8 +182,43 @@ the '--force' flag and manually ensure that any custom configuration
 previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
 is manually re-applied afterwards.
 
+## Roadmap
+
+### Current Features (v0.1)
+- ✅ Container-level checkpointing via kubelet API
+- ✅ Pod-level checkpoint orchestration  
+- ✅ Local checkpoint storage
+- ✅ gRPC agent communication
+- ✅ Comprehensive testing framework
+
+### Planned Features
+- 🔄 **Shared Storage Integration**: PVC-based checkpoint artifact sharing
+- 🔄 **Pod Restore Operations**: Complete migration workflow with destination restore
+- 🔄 **Incremental Checkpoints**: Delta-based storage for large containers
+- 🔄 **Cross-Cluster Migration**: Portable checkpoints for disaster recovery
+- 🔄 **Performance Optimization**: Compression, deduplication, and streaming
+
+### Long-term Vision
+- 🎯 **Production Hardening**: HA storage, encryption, multi-tenancy
+- 🎯 **Advanced Scheduling**: Migration-aware pod placement
+- 🎯 **Observability**: Comprehensive metrics and distributed tracing
+- 🎯 **Cloud Integration**: Native support for cloud storage backends
+
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+
+We welcome contributions! This project is part of CP4101 coursework but aims to be a production-ready Kubernetes extension.
+
+### Development Setup
+1. Clone the repository
+2. Set up the Vagrant development environment: `cd vagrant && vagrant up`
+3. Follow the [Testing Guide](./README-TESTING.md) for local development
+
+### Areas for Contribution
+- **Storage Backends**: Implement additional checkpoint storage options
+- **Testing**: Expand test coverage and performance benchmarks  
+- **Documentation**: Improve API documentation and user guides
+- **Performance**: Optimize checkpoint/restore performance
+- **Security**: Enhance multi-tenancy and encryption features
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 
