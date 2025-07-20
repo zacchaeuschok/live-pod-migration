@@ -85,6 +85,8 @@ spec:
               mountPath: /var/lib/kubelet/checkpoints
             - name: checkpoint-repo
               mountPath: /mnt/checkpoints
+            - name: container-storage
+              mountPath: /var/lib/containers/storage
             - name: sysfs
               mountPath: /sys
               readOnly: true
@@ -113,6 +115,10 @@ spec:
         - name: checkpoint-repo
           persistentVolumeClaim:
             claimName: checkpoint-repo
+        - name: container-storage
+          hostPath:
+            path: /var/lib/containers/storage
+            type: DirectoryOrCreate
         - name: sysfs
           hostPath:
             path: /sys

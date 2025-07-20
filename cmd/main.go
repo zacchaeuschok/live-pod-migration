@@ -204,8 +204,9 @@ func main() {
 	}
 
 	if err = (&controller.PodMigrationReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		AgentClient: agent.NewClient(mgr.GetClient()),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PodMigration")
 		os.Exit(1)
