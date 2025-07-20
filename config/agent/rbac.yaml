@@ -26,3 +26,30 @@ subjects:
 - kind: ServiceAccount
   name: checkpoint-agent
   namespace: system
+---
+# Allow nodes to access kubelet checkpoint API via proxy
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubelet-checkpoint-proxy
+  labels:
+    app: checkpoint-agent
+rules:
+- apiGroups: [""]
+  resources: ["nodes/proxy"]
+  verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubelet-checkpoint-proxy
+  labels:
+    app: checkpoint-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubelet-checkpoint-proxy
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: system:nodes

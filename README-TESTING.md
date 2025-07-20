@@ -168,6 +168,8 @@ kubectl exec -n live-pod-migration-controller-system $(kubectl get pods -n live-
 
 ### 7. Test Live Pod Migration
 
+#### Option 7A: Cross-Node Migration (Advanced - May Fail Due to Network Namespaces)
+
 ```bash
 # Create a test pod with some state - scheduled on master node
 kubectl apply -f - <<EOF
@@ -241,6 +243,210 @@ kubectl exec stateful-pod -c writer -- tail -10 /data/log.txt
 
 # Check that timestamps show continuity (no major gaps indicating successful state preservation)
 ```
+
+#### Option 7B: Same-Node Migration Test (Recommended for Testing Network Namespace Issues)
+
+```bash
+# Create a test pod with some state - scheduled on worker node
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stateful-pod-same-node
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: k8s-worker
+  containers:
+  - name: nginx
+    image: docker.io/library/nginx:1.21
+    ports:
+    - containerPort: 80
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  - name: writer
+    image: docker.io/library/busybox:1.35
+    command: ['sh', '-c', 'while true; do echo "$(date): Hello from $(hostname)" >> /data/log.txt; sleep 2; done']
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    emptyDir: {}
+EOF
+
+# Wait for pod to be running and accumulate some state
+kubectl wait --for=condition=Ready pod/stateful-pod-same-node --timeout=60s
+sleep 10
+
+# Verify pod is running on worker node
+kubectl get pod stateful-pod-same-node -o wide
+
+# Check the data being written to verify state
+kubectl exec stateful-pod-same-node -c writer -- tail -5 /data/log.txt
+
+# Create a PodMigration for same-node migration (tests checkpoint/restore without network namespace changes)
+kubectl apply -f - <<EOF
+apiVersion: lpm.my.domain/v1
+kind: PodMigration
+metadata:
+  name: migrate-worker-to-worker
+  namespace: default
+spec:
+  podName: stateful-pod-same-node
+  targetNode: k8s-worker
+EOF
+
+# Watch the migration progress
+kubectl get podmigration migrate-worker-to-worker -w
+
+# Verify checkpoint was created
+kubectl get podcheckpoint
+kubectl get containercheckpoint
+
+# After migration completes, verify the restored pod
+kubectl get pods -l migration.source-pod=stateful-pod-same-node -o wide
+
+# Check restored pod status
+RESTORED_POD=$(kubectl get pods -l migration.source-pod=stateful-pod-same-node -o jsonpath='{.items[0].metadata.name}')
+echo "Restored pod: $RESTORED_POD"
+kubectl describe pod $RESTORED_POD
+
+# If restoration was successful, verify state preservation
+if kubectl get pod $RESTORED_POD --no-headers | grep -q Running; then
+  echo "SUCCESS: Pod restored and running!"
+  kubectl exec $RESTORED_POD -c writer -- tail -10 /data/log.txt
+else
+  echo "ISSUE: Pod not running, checking logs..."
+  kubectl logs $RESTORED_POD -c nginx
+  kubectl logs $RESTORED_POD -c writer
+fi
+
+# Clean up the test
+kubectl delete pod stateful-pod-same-node --ignore-not-found=true
+kubectl delete pod $RESTORED_POD --ignore-not-found=true
+kubectl delete podmigration migrate-worker-to-worker --ignore-not-found=true
+```
+
+**Note**: Same-node migration tests the checkpoint/restore mechanism without network namespace complications. If this fails, the issue is with the basic CRIU restore process. If this succeeds but cross-node migration fails, then the issue is specifically network namespace migration (as suspected).
+
+### 7C: Fixing Container Restoration Issues
+
+If containers are successfully restored but terminate with exit code 137 (SIGKILL) shortly after restoration, this indicates environment mismatch issues between the original and restored containers. Here are the specific fixes needed:
+
+#### Root Cause Analysis
+
+Based on our investigation, containers terminate after restoration due to:
+
+1. **Network namespace changes**: Containers checkpointed on one network configuration cannot adapt to different network namespaces
+2. **Mount point differences**: File system mount points may differ between original and restored environments
+3. **Process tree inconsistencies**: CRIU expects the exact same process environment for successful restoration
+4. **Container runtime context mismatch**: OCI runtime state differs between checkpoint and restore time
+
+#### Solution 1: Enable Cross-Environment CRIU Options
+
+Update the checkpoint agent to use CRIU options that handle environment changes:
+
+```bash
+# Edit the checkpoint agent to add environment-agnostic CRIU options
+kubectl edit configmap checkpoint-agent-config -n live-pod-migration-controller-system
+
+# Add these CRIU restoration options in the agent configuration:
+# --tcp-established: Handle established TCP connections 
+# --ext-mount-map: Map external mount points to new locations
+# --manage-cgroups: Allow CRIU to recreate cgroup hierarchy
+# --shell-job: Handle process groups properly
+# --file-locks: Restore file locks in new environment
+```
+
+#### Solution 2: Update Container Image Restoration Process
+
+Modify the PodMigration controller restore phase to handle network namespace transitions:
+
+```bash
+# The controller needs to update container specifications during restoration:
+# 1. Reset network-specific environment variables
+# 2. Clear pod IP and host IP references  
+# 3. Remove node-specific volume mounts
+# 4. Update DNS configuration for new node
+```
+
+#### Solution 3: Implement Pre-Restore Environment Preparation
+
+Add environment preparation steps before triggering container restoration:
+
+```bash
+# Create a pre-restore hook that:
+# 1. Ensures identical cgroup structure on target node
+# 2. Creates necessary mount points and directories
+# 3. Sets up network interfaces in compatible state
+# 4. Configures security contexts to match original environment
+```
+
+#### Solution 4: Use CRIU Lazy Pages (Advanced)
+
+For large containers with significant memory state, enable CRIU lazy pages migration:
+
+```bash
+# Configure the checkpoint agent to use:
+# --lazy-pages: Stream memory pages on-demand during restoration
+# --page-server: Use dedicated page server for cross-node memory transfer
+# This reduces initial restoration time and handles memory layout differences
+```
+
+#### Immediate Fix: Modify Checkpoint Agent
+
+Update `cmd/checkpoint-agent/main.go` to use these CRIU restoration options:
+
+```go
+// Add to the container restoration command in CRI-O integration:
+criuOpts := []string{
+    "--tcp-established",
+    "--ext-mount-map", "/old/path:/new/path", 
+    "--manage-cgroups",
+    "--shell-job",
+    "--file-locks",
+}
+```
+
+#### Implementation Priority
+
+1. **High Priority**: Solution 2 (Container specification reset) - addresses network namespace issues
+2. **Medium Priority**: Solution 1 (CRIU options) - handles process-level environment changes  
+3. **Low Priority**: Solutions 3-4 (Advanced features) - for complex migration scenarios
+
+#### Testing the Fix
+
+After implementing the fixes:
+
+```bash
+# Test same-node migration (should work with network namespace fixes)
+kubectl apply -f - <<EOF
+apiVersion: lpm.my.domain/v1
+kind: PodMigration
+metadata:
+  name: test-fixed-migration
+  namespace: default  
+spec:
+  podName: stateful-pod-same-node
+  targetNode: k8s-worker
+EOF
+
+# Verify restored container runs successfully
+kubectl get pods -l migration.source-pod=stateful-pod-same-node
+kubectl logs <restored-pod-name> -c nginx  # Should show successful startup
+kubectl logs <restored-pod-name> -c writer # Should show continued log writing
+```
+
+#### Expected Results After Fix
+
+- Containers should start successfully without exit code 137
+- Process state should be preserved (log timestamps show continuity)
+- Network connectivity should work in the new environment
+- File system state should be maintained across migration
+
+The key insight is that CRIU checkpoint/restore works, but the container runtime context needs to be adapted for the new environment during restoration.
 
 ### 8. Verify Cross-Node Checkpoint Access
 
