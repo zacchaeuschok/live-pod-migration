@@ -398,54 +398,40 @@ func (r *PodMigrationReconciler) createRestoredPod(ctx context.Context, podMigra
 		return nil, fmt.Errorf("failed to get original pod: %w", err)
 	}
 
-	checkpointContent, err := r.getCheckpointContent(ctx, podMigration)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get checkpoint content: %w", err)
+	// START WITH THE ORIGINAL POD - preserve all runtime context
+	restoredPod := originalPod.DeepCopy()
+
+	// Change only what's absolutely necessary
+	restoredPod.ObjectMeta.Name = fmt.Sprintf("%s-restored", originalPod.Name)
+	restoredPod.ObjectMeta.ResourceVersion = ""  // Required for creation
+	restoredPod.ObjectMeta.UID = ""              // Required for creation
+	restoredPod.Spec.NodeName = podMigration.Spec.TargetNode // Target node
+
+	// Add migration tracking annotations
+	if restoredPod.ObjectMeta.Annotations == nil {
+		restoredPod.ObjectMeta.Annotations = make(map[string]string)
+	}
+	restoredPod.ObjectMeta.Annotations["migration.source-pod"] = originalPod.Name
+	restoredPod.ObjectMeta.Annotations["migration.target-node"] = podMigration.Spec.TargetNode
+
+	// Set owner reference
+	restoredPod.ObjectMeta.OwnerReferences = []metav1.OwnerReference{
+		*metav1.NewControllerRef(podMigration, lpmv1.GroupVersion.WithKind("PodMigration")),
 	}
 
-	restoredPodName := fmt.Sprintf("%s-restored", originalPod.Name)
-
-	restoredPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      restoredPodName,
-			Namespace: originalPod.Namespace,
-			Labels:    originalPod.Labels,
-			Annotations: map[string]string{
-				"migration.source-pod":        originalPod.Name,
-				"migration.target-node":       podMigration.Spec.TargetNode,
-				"migration.checkpoint-source": checkpointContent.Name,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(podMigration, lpmv1.GroupVersion.WithKind("PodMigration")),
-			},
-		},
-		Spec: corev1.PodSpec{
-			NodeName:           podMigration.Spec.TargetNode,
-			RestartPolicy:      corev1.RestartPolicyNever,
-			ServiceAccountName: originalPod.Spec.ServiceAccountName,
-			SecurityContext:    originalPod.Spec.SecurityContext,
-			Volumes:            originalPod.Spec.Volumes,
-			Containers:         make([]corev1.Container, len(originalPod.Spec.Containers)),
-		},
+	// Apply checkpoint images to containers (existing logic)
+	if podMigration.Status.CheckpointImages == nil {
+		return nil, fmt.Errorf("checkpoint images not prepared for migration")
 	}
 
-	for i, container := range originalPod.Spec.Containers {
-		restoredContainer := container.DeepCopy()
-
-		// Use pre-prepared checkpoint images from PreparingImages phase
-		if podMigration.Status.CheckpointImages == nil {
-			return nil, fmt.Errorf("checkpoint images not prepared for migration")
-		}
-
+	for i, container := range restoredPod.Spec.Containers {
 		checkpointImage, exists := podMigration.Status.CheckpointImages[container.Name]
 		if !exists {
 			return nil, fmt.Errorf("no checkpoint image prepared for container %s", container.Name)
 		}
 
-		restoredContainer.Image = checkpointImage
-		restoredContainer.ImagePullPolicy = corev1.PullNever
-
-		restoredPod.Spec.Containers[i] = *restoredContainer
+		restoredPod.Spec.Containers[i].Image = checkpointImage
+		restoredPod.Spec.Containers[i].ImagePullPolicy = corev1.PullNever
 	}
 
 	return restoredPod, nil

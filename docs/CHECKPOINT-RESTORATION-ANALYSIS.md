@@ -657,6 +657,333 @@ The current approach is architecturally correct. The issue is in fine-tuning the
 
 The core architecture is sound - the issue is in the details of environmental adaptation during restoration.
 
+## Update: Testing Results (August 13, 2025)
+
+### Issue Discovered: Kubelet Image Validation Blocking Checkpoint Restoration
+
+During testing of the pod migration functionality, we discovered that **kubelet is blocking the checkpoint restoration before it even reaches CRI-O**. This contradicts the expected flow documented above.
+
+#### Test Setup
+
+1. **Created test pod** on worker node:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stateful-pod-same-node
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: k8s-worker
+  containers:
+  - name: nginx
+    image: docker.io/library/nginx:1.21
+  - name: writer
+    image: docker.io/library/busybox:1.35
+    command: ['sh', '-c', 'while true; do echo "$(date): Hello" >> /data/log.txt; sleep 2; done']
+```
+
+2. **Created PodMigration** for same-node migration:
+```yaml
+apiVersion: lpm.my.domain/v1
+kind: PodMigration
+metadata:
+  name: migrate-worker-to-worker
+spec:
+  podName: stateful-pod-same-node
+  targetNode: k8s-worker
+```
+
+#### Results
+
+**Checkpoint Creation: ✅ SUCCESS**
+- PodCheckpoint created successfully
+- ContainerCheckpoints created for both containers
+- Checkpoint files saved to shared storage:
+```bash
+$ kubectl exec -n live-pod-migration-controller-system $AGENT_POD -- ls -la /mnt/checkpoints/
+-rw-r--r-- 1 root root 3758592 Aug 13 06:42 659eff0c-10ce-4f20-937b-0250aa40812e-nginx-20250813-064247.tar
+-rw-r--r-- 1 root root  418816 Aug 13 06:42 659eff0c-10ce-4f20-937b-0250aa40812e-writer-20250813-064247.tar
+```
+
+**Pod Restoration: ❌ FAILED**
+
+The restored pod was created with checkpoint tar files as container images:
+```bash
+$ kubectl describe pod stateful-pod-same-node-restored
+...
+Containers:
+  nginx:
+    Image: /mnt/checkpoints/659eff0c-10ce-4f20-937b-0250aa40812e-nginx-20250813-064247.tar
+    State: Waiting
+      Reason: InvalidImageName
+  writer:
+    Image: /mnt/checkpoints/659eff0c-10ce-4f20-937b-0250aa40812e-writer-20250813-064247.tar
+    State: Waiting
+      Reason: InvalidImageName
+```
+
+**Kubelet Error Logs:**
+```
+Events:
+  Type     Reason         Age    From     Message
+  ----     ------         ----   ----     -------
+  Warning  InspectFailed  82s    kubelet  Failed to apply default image tag "/mnt/checkpoints/659eff0c-10ce-4f20-937b-0250aa40812e-nginx-20250813-064247.tar": couldn't parse image name "/mnt/checkpoints/659eff0c-10ce-4f20-937b-0250aa40812e-nginx-20250813-064247.tar": invalid reference format
+  Warning  Failed         82s    kubelet  Error: InvalidImageName
+```
+
+**CRI-O Logs Analysis:**
+```bash
+$ sudo journalctl -u crio -f | grep -E "(checkpoint|restore|CRImportCheckpoint)"
+# NO checkpoint-related messages found - request never reaches CRI-O
+```
+
+### Root Cause Analysis
+
+The issue occurs at **Step 2.1** in the kubelet flow documented above. Specifically:
+
+1. **PodMigration Controller** correctly sets `container.Image = "/mnt/checkpoints/checkpoint.tar"` (✅ Working as designed)
+
+2. **Kubelet Image Validation** in `EnsureImageExists()` **rejects the path** before CRI call (❌ Blocking point):
+   - Kubelet validates image names using Docker reference format
+   - File paths like `/mnt/checkpoints/file.tar` fail this validation
+   - The error occurs in `imageManager.EnsureImageExists()` before any CRI interaction
+
+3. **CRI-O never receives the request** to create a container with the checkpoint path (⚠️ Never reached)
+
+### Evidence from Code Analysis
+
+Looking at the kubelet code path:
+```go
+// kubernetes/pkg/kubelet/kuberuntime/kuberuntime_container.go:212
+imageRef, msg, err := m.imageManager.EnsureImageExists(...)
+if err != nil {
+    return err // ← FAILS HERE with "invalid reference format"
+}
+// Never reaches CreateContainer CRI call
+```
+
+The image manager validates the image reference:
+```go
+// kubernetes/pkg/kubelet/images/image_manager.go
+// Attempts to parse image as Docker reference
+// File paths are not valid Docker references
+```
+
+### Discrepancy with Documentation
+
+The analysis above states that "kubelet treats our checkpoint file path as a normal container image throughout the entire flow" and that "checkpoint detection only happens at the CRI-O level". However, testing shows that:
+
+1. **Kubelet DOES validate image names** before passing to CRI
+2. **File paths are rejected** as invalid image references
+3. **CRI-O's checkpoint detection logic is never triggered** because the request doesn't reach it
+
+### Potential Solutions
+
+#### Solution 1: Use OCI Checkpoint Images
+Instead of file paths, create OCI-compliant checkpoint images that CRI-O can pull:
+```bash
+# Package checkpoint as OCI image
+buildah from scratch
+buildah add $container /mnt/checkpoints/checkpoint.tar /checkpoint.tar
+buildah config --annotation io.kubernetes.cri-o.checkpoint=true $container
+buildah commit $container localhost/checkpoint:$ID
+```
+
+#### Solution 2: Bypass Image Validation
+Modify kubelet to skip image validation for checkpoint restoration (requires kubelet changes)
+
+#### Solution 3: Use Annotation-Based Restoration
+Instead of replacing the image, use annotations to trigger restoration:
+```yaml
+metadata:
+  annotations:
+    io.kubernetes.cri-o.checkpoint-image: "/mnt/checkpoints/checkpoint.tar"
+spec:
+  containers:
+  - name: nginx
+    image: docker.io/library/nginx:1.21  # Keep original image
+```
+
+#### Solution 4: Direct CRI-O API Interaction
+Bypass kubelet entirely and interact with CRI-O directly for restoration (requires significant architecture change)
+
+### Verification Needed
+
+To confirm this analysis:
+1. Check if CRI-O supports OCI checkpoint images
+2. Test if annotations can trigger checkpoint restoration
+3. Verify if there's an undocumented way to pass file paths through kubelet
+
+## Deep Code Investigation Results (August 13, 2025)
+
+### Exact Location of Image Validation Failure
+
+Through detailed code analysis of both kubelet and CRI-O, I've pinpointed the exact failure location:
+
+**File:** `/kubernetes/pkg/kubelet/images/image_manager.go:155`
+```go
+func (m *imageManager) EnsureImageExists(...) {
+    // Line 155: THIS IS WHERE IT FAILS
+    image, err := applyDefaultImageTag(requestedImage)
+    if err != nil {
+        msg := fmt.Sprintf("Failed to apply default image tag %q: %v", requestedImage, err)
+        return "", msg, ErrInvalidImageName  // ← CHECKPOINT RESTORATION BLOCKED HERE
+    }
+    // ... rest never executes for checkpoint paths
+}
+```
+
+**File:** `/kubernetes/pkg/util/parsers/parsers.go:32`
+```go
+func ParseImageName(image string) (string, string, string, error) {
+    named, err := dockerref.ParseNormalizedNamed(image)  // ← FAILS HERE
+    if err != nil {
+        return "", "", "", fmt.Errorf("couldn't parse image name %q: %v", image, err)
+    }
+    // ...
+}
+```
+
+The `dockerref.ParseNormalizedNamed(image)` function from the Docker distribution library expects Docker image references (e.g., `nginx:1.21`) and **rejects file paths** like `/mnt/checkpoints/file.tar`.
+
+### CRI-O Checkpoint Detection Confirmation
+
+**File:** `/cri-o/server/container_create.go` (confirmed working correctly)
+```go
+func (s *Server) CreateContainer(ctx context.Context, req *types.CreateContainerRequest) {
+    checkpointImage, err := func() (bool, error) {
+        if !s.config.CheckpointRestore() {
+            return false, nil
+        }
+        if _, err := os.Stat(req.Config.Image.Image); err == nil {  // ← WORKS PERFECTLY
+            log.Debugf(ctx, "%q is a file. Assuming it is a checkpoint archive", req.Config.Image.Image)
+            return true, nil
+        }
+        // Also supports OCI checkpoint images
+        imageID, err := s.checkIfCheckpointOCIImage(ctx, req.Config.Image.Image)
+        return imageID != nil, nil
+    }()
+    // If checkpoint detected, uses completely different restoration path...
+}
+```
+
+**Status**: ✅ CRI-O checkpoint detection works perfectly - the problem is kubelet blocking the request.
+
+### Proposed Solutions
+
+#### Solution 1: Modify PodMigration Controller to Use Valid Image References
+
+Instead of using raw file paths, create image references that pass kubelet validation but are still detectable by CRI-O:
+
+```go
+// In createRestoredPod() function
+// CURRENT (FAILING):
+restoredContainer.Image = "/mnt/checkpoints/checkpoint.tar"
+
+// PROPOSED (WORKING):
+restoredContainer.Image = "localhost/checkpoint:" + checkpointID
+// And create a symbolic link: 
+// ln -s /mnt/checkpoints/checkpoint.tar /var/lib/containers/storage/overlay/checkpoint-id
+```
+
+#### Solution 2: Use OCI Checkpoint Images (CRI-O Native Support)
+
+CRI-O already supports OCI checkpoint images. Package checkpoints as proper OCI images:
+
+```bash
+# In checkpoint agent, after creating tar file:
+buildah from scratch
+buildah add working-container /mnt/checkpoints/checkpoint.tar /
+buildah config --annotation "io.kubernetes.cri-o.checkpoint=true" working-container
+buildah commit working-container localhost/checkpoint:$CHECKPOINT_ID
+```
+
+Then use in controller:
+```go
+restoredContainer.Image = "localhost/checkpoint:" + checkpointID
+restoredContainer.ImagePullPolicy = corev1.PullNever
+```
+
+#### Solution 3: Annotation-Based Approach (EXPERIMENTAL)
+
+Use pod annotations to pass checkpoint information while keeping original images:
+
+```go
+// Keep original image to pass validation
+restoredContainer.Image = container.Image  // e.g., "nginx:1.21"
+restoredContainer.ImagePullPolicy = corev1.PullNever
+
+// Add checkpoint annotation
+restoredPod.Annotations["io.kubernetes.cri-o.checkpoint-path"] = checkpointFilePath
+```
+
+**Note**: This requires verification that CRI-O supports annotation-based checkpoint triggers.
+
+#### Solution 4: Kubelet Bypass via Direct CRI Calls (COMPLEX)
+
+Modify the checkpoint agent to interact directly with CRI-O, bypassing kubelet entirely:
+
+```go
+// In checkpoint agent restoration
+criClient := &criapi.RuntimeServiceClient{...}
+createReq := &runtimeapi.CreateContainerRequest{
+    Config: &runtimeapi.ContainerConfig{
+        Image: &runtimeapi.ImageSpec{
+            Image: "/mnt/checkpoints/checkpoint.tar",  // Direct to CRI-O
+        },
+    },
+}
+containerID, err := criClient.CreateContainer(ctx, createReq)
+```
+
+**Drawback**: Requires significant architecture changes and bypasses Kubernetes pod lifecycle.
+
+### Recommended Implementation: Solution 2 (OCI Checkpoint Images)
+
+**Rationale:**
+1. **Standards Compliant**: Uses proper OCI image format
+2. **CRI-O Native**: Leverages existing CRI-O checkpoint image support  
+3. **Kubernetes Compatible**: Passes kubelet validation
+4. **Minimal Changes**: Only requires checkpoint agent modification
+
+**Implementation Steps:**
+
+1. **Modify Checkpoint Agent** (`cmd/checkpoint-agent/main.go`):
+```go
+func createCheckpointOCIImage(checkpointPath, checkpointID string) error {
+    // Create OCI image from checkpoint tar
+    cmd := exec.Command("buildah", "from", "scratch")
+    containerID, _ := cmd.Output()
+    
+    exec.Command("buildah", "add", string(containerID), checkpointPath, "/").Run()
+    exec.Command("buildah", "config", "--annotation", "io.kubernetes.cri-o.checkpoint=true", string(containerID)).Run()
+    exec.Command("buildah", "commit", string(containerID), "localhost/checkpoint:"+checkpointID).Run()
+    
+    return nil
+}
+```
+
+2. **Modify ContainerCheckpointContent** to store OCI image references instead of file paths:
+```yaml
+spec:
+  artifactURI: "localhost/checkpoint:nginx-20250813-064247"  # Instead of file path
+```
+
+3. **Update PodMigration Controller** (`createRestoredPod()`):
+```go
+restoredContainer.Image = checkpointContent.Spec.ArtifactURI  // Now a valid OCI reference
+restoredContainer.ImagePullPolicy = corev1.PullNever
+```
+
+**Expected Flow After Fix:**
+1. ✅ Kubelet validates `localhost/checkpoint:id` (passes Docker reference validation)
+2. ✅ Kubelet calls CRI-O with OCI image reference
+3. ✅ CRI-O detects OCI checkpoint image via `checkIfCheckpointOCIImage()`
+4. ✅ CRI-O imports and restores container from checkpoint
+5. ✅ Container restoration succeeds (with proper CRIU options)
+
+This solution maintains the architectural integrity while making the system work within Kubernetes/Docker image validation constraints.
+
 ## Function Invocation Tracing Commands
 
 Use these commands to trace the complete function call chain during pod migration without overwhelming log volume.

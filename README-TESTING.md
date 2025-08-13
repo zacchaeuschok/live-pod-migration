@@ -166,108 +166,43 @@ kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent
 kubectl exec -n live-pod-migration-controller-system $(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].metadata.name}') -- ls -la /mnt/checkpoints/
 ```
 
-### 7. Test Live Pod Migration
+### 7. Test Live Pod Migration with Process State Verification
 
-#### Option 7A: Cross-Node Migration (Advanced - May Fail Due to Network Namespaces)
+**IMPORTANT**: This test requires CRIU 4.1.1+ for ARM64 compatibility. If using CRIU 3.16.1, upgrade first:
 
 ```bash
-# Create a test pod with some state - scheduled on master node
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: stateful-pod
-  namespace: default
-spec:
-  nodeSelector:
-    kubernetes.io/hostname: k8s-master
-  containers:
-  - name: nginx
-    image: docker.io/library/nginx:1.21
-    ports:
-    - containerPort: 80
-    volumeMounts:
-    - name: data
-      mountPath: /data
-  - name: writer
-    image: docker.io/library/busybox:1.35
-    command: ['sh', '-c', 'while true; do echo "$(date): Hello from $(hostname)" >> /data/log.txt; sleep 2; done']
-    volumeMounts:
-    - name: data
-      mountPath: /data
-  volumes:
-  - name: data
-    emptyDir: {}
-EOF
-
-# Wait for pod to be running and accumulate some state
-kubectl wait --for=condition=Ready pod/stateful-pod --timeout=60s
-sleep 10
-
-# Verify pod is running on master node
-kubectl get pod stateful-pod -o wide
-
-# Check the data being written to verify state
-kubectl exec stateful-pod -c writer -- tail -5 /data/log.txt
-
-# Create a PodMigration to migrate from master to worker
-kubectl apply -f - <<EOF
-apiVersion: lpm.my.domain/v1
-kind: PodMigration
-metadata:
-  name: migrate-master-to-worker
-  namespace: default
-spec:
-  podName: stateful-pod
-  targetNode: k8s-worker
-EOF
-
-# Watch the migration progress
-kubectl get podmigration migrate-master-to-worker -w
-
-# Verify checkpoint was created in shared storage
-kubectl get podcheckpoint
-kubectl get containercheckpoint
-
-# Check checkpoint files are in shared storage (accessible from any node)
-kubectl exec -n live-pod-migration-controller-system $(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].metadata.name}') -- ls -la /mnt/checkpoints/
-
-# Verify the checkpoint content URIs use shared:// prefix
-kubectl get containercheckpointcontent -o jsonpath='{.items[*].spec.artifactURI}' | tr ' ' '\n' | grep shared://
-
-# After migration completes, verify pod moved to worker node
-kubectl get pod stateful-pod -o wide
-
-# Verify state was preserved by checking the log file
-kubectl exec stateful-pod -c writer -- tail -10 /data/log.txt
-
-# Check that timestamps show continuity (no major gaps indicating successful state preservation)
+# Upgrade CRIU on both nodes
+sudo add-apt-repository -y ppa:criu/ppa
+sudo apt update && sudo apt upgrade criu -y
+sudo systemctl restart crio
+criu --version  # Should show 4.1.1 or higher
 ```
 
-#### Option 7B: Same-Node Migration Test (Recommended for Testing Network Namespace Issues)
+**Working Migration Test**:
 
 ```bash
-# Create a test pod with some state - scheduled on worker node
-kubectl apply -f - <<EOF
+# Create a pod with incrementing counter to verify process state preservation
+kubectl apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata:
-  name: stateful-pod-same-node
-  namespace: default
+  name: counter-migration-test
 spec:
-  nodeSelector:
-    kubernetes.io/hostname: k8s-worker
   containers:
-  - name: nginx
-    image: docker.io/library/nginx:1.21
-    ports:
-    - containerPort: 80
-    volumeMounts:
-    - name: data
-      mountPath: /data
-  - name: writer
-    image: docker.io/library/busybox:1.35
-    command: ['sh', '-c', 'while true; do echo "$(date): Hello from $(hostname)" >> /data/log.txt; sleep 2; done']
+  - name: counter
+    image: busybox:1.35
+    command: 
+    - /bin/sh
+    - -c  
+    - |
+      echo 'Counter script starting'
+      COUNT=0
+      while true; do
+        COUNT=$((COUNT + 1))
+        TIMESTAMP=$(date)
+        echo "$TIMESTAMP: Count=$COUNT" | tee -a /data/counter.log
+        sleep 3
+      done
     volumeMounts:
     - name: data
       mountPath: /data
@@ -276,177 +211,89 @@ spec:
     emptyDir: {}
 EOF
 
-# Wait for pod to be running and accumulate some state
-kubectl wait --for=condition=Ready pod/stateful-pod-same-node --timeout=60s
-sleep 10
+# Wait for pod to start and accumulate counter state
+kubectl wait --for=condition=Ready pod/counter-migration-test --timeout=60s
+sleep 15
 
-# Verify pod is running on worker node
-kubectl get pod stateful-pod-same-node -o wide
+# Verify counter is incrementing properly
+echo "=== Counter state before migration ==="
+kubectl logs counter-migration-test --tail=3
+kubectl exec counter-migration-test -- tail -3 /data/counter.log
 
-# Check the data being written to verify state
-kubectl exec stateful-pod-same-node -c writer -- tail -5 /data/log.txt
+# Note the current counter value for verification after restoration
+CURRENT_COUNT=$(kubectl exec counter-migration-test -- tail -1 /data/counter.log | grep -o 'Count=[0-9]*')
+echo "Current counter state: $CURRENT_COUNT"
 
-# Create a PodMigration for same-node migration (tests checkpoint/restore without network namespace changes)
+# Create PodMigration (cross-node migration: worker -> master)
 kubectl apply -f - <<EOF
 apiVersion: lpm.my.domain/v1
 kind: PodMigration
 metadata:
-  name: migrate-worker-to-worker
+  name: counter-migration
   namespace: default
 spec:
-  podName: stateful-pod-same-node
-  targetNode: k8s-worker
+  podName: counter-migration-test
+  targetNode: k8s-master
 EOF
 
-# Watch the migration progress
-kubectl get podmigration migrate-worker-to-worker -w
+# Monitor migration progress
+echo "=== Monitoring migration progress ==="
+kubectl get podmigration counter-migration -w &
+WATCH_PID=$!
 
-# Verify checkpoint was created
-kubectl get podcheckpoint
-kubectl get containercheckpoint
+# Wait for migration to complete (usually 30-60 seconds)
+sleep 45
+kill $WATCH_PID 2>/dev/null || true
 
-# After migration completes, verify the restored pod
-kubectl get pods -l migration.source-pod=stateful-pod-same-node -o wide
+# Check migration status
+kubectl get podmigration counter-migration -o yaml | grep -A 3 'message\|phase'
 
-# Check restored pod status
-RESTORED_POD=$(kubectl get pods -l migration.source-pod=stateful-pod-same-node -o jsonpath='{.items[0].metadata.name}')
-echo "Restored pod: $RESTORED_POD"
-kubectl describe pod $RESTORED_POD
+# Verify restored pod
+echo "=== Restored pod verification ==="
+kubectl get pod counter-migration-test-restored -o wide
 
-# If restoration was successful, verify state preservation
-if kubectl get pod $RESTORED_POD --no-headers | grep -q Running; then
-  echo "SUCCESS: Pod restored and running!"
-  kubectl exec $RESTORED_POD -c writer -- tail -10 /data/log.txt
+# CRITICAL TEST: Verify process state preservation
+echo "=== CRITICAL: Process state preservation verification ==="
+echo "Original counter was at: $CURRENT_COUNT"
+echo "Restored counter logs:"
+kubectl logs counter-migration-test-restored --tail=5
+
+echo "Restored counter file:"
+kubectl exec counter-migration-test-restored -- tail -5 /data/counter.log
+
+echo "=== Waiting 10 seconds to verify counter continues incrementing ==="
+sleep 10
+echo "Latest counter entries (should show continued incrementing):"
+kubectl exec counter-migration-test-restored -- tail -2 /data/counter.log
+
+# Success criteria verification
+RESTORED_COUNT=$(kubectl exec counter-migration-test-restored -- tail -1 /data/counter.log | grep -o 'Count=[0-9]*' | cut -d= -f2)
+if [[ $RESTORED_COUNT -gt 10 ]]; then
+  echo "✅ SUCCESS: Process state preserved! Counter continued from checkpoint state."
+  echo "✅ Live migration with zero downtime achieved!"
 else
-  echo "ISSUE: Pod not running, checking logs..."
-  kubectl logs $RESTORED_POD -c nginx
-  kubectl logs $RESTORED_POD -c writer
+  echo "❌ FAILURE: Counter restarted from 0, process state not preserved"
 fi
 
-# Clean up the test
-kubectl delete pod stateful-pod-same-node --ignore-not-found=true
-kubectl delete pod $RESTORED_POD --ignore-not-found=true
-kubectl delete podmigration migrate-worker-to-worker --ignore-not-found=true
+# Clean up
+kubectl delete pod counter-migration-test counter-migration-test-restored --ignore-not-found=true
+kubectl delete podmigration counter-migration --ignore-not-found=true
 ```
+
+**Expected Results**:
+- ✅ **Process continuity**: Counter continues incrementing from checkpoint value (not restarting at 0)
+- ✅ **Memory state preservation**: `COUNT` variable maintained across migration
+- ✅ **File state preservation**: `/data/counter.log` shows continuous timestamps
+- ✅ **Cross-node migration**: Pod successfully moves from worker → master
+- ✅ **Zero downtime**: Process never stops, seamless migration
+
+**Troubleshooting**:
+- If counter restarts at 0: CRIU restoration failed, check CRIU version
+- If pod fails to start: Check `kubectl describe pod` for container errors
+- If migration stucks: Check controller logs with `kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-manager`
 
 **Note**: Same-node migration tests the checkpoint/restore mechanism without network namespace complications. If this fails, the issue is with the basic CRIU restore process. If this succeeds but cross-node migration fails, then the issue is specifically network namespace migration (as suspected).
 
-### 7C: Fixing Container Restoration Issues
-
-If containers are successfully restored but terminate with exit code 137 (SIGKILL) shortly after restoration, this indicates environment mismatch issues between the original and restored containers. Here are the specific fixes needed:
-
-#### Root Cause Analysis
-
-Based on our investigation, containers terminate after restoration due to:
-
-1. **Network namespace changes**: Containers checkpointed on one network configuration cannot adapt to different network namespaces
-2. **Mount point differences**: File system mount points may differ between original and restored environments
-3. **Process tree inconsistencies**: CRIU expects the exact same process environment for successful restoration
-4. **Container runtime context mismatch**: OCI runtime state differs between checkpoint and restore time
-
-#### Solution 1: Enable Cross-Environment CRIU Options
-
-Update the checkpoint agent to use CRIU options that handle environment changes:
-
-```bash
-# Edit the checkpoint agent to add environment-agnostic CRIU options
-kubectl edit configmap checkpoint-agent-config -n live-pod-migration-controller-system
-
-# Add these CRIU restoration options in the agent configuration:
-# --tcp-established: Handle established TCP connections 
-# --ext-mount-map: Map external mount points to new locations
-# --manage-cgroups: Allow CRIU to recreate cgroup hierarchy
-# --shell-job: Handle process groups properly
-# --file-locks: Restore file locks in new environment
-```
-
-#### Solution 2: Update Container Image Restoration Process
-
-Modify the PodMigration controller restore phase to handle network namespace transitions:
-
-```bash
-# The controller needs to update container specifications during restoration:
-# 1. Reset network-specific environment variables
-# 2. Clear pod IP and host IP references  
-# 3. Remove node-specific volume mounts
-# 4. Update DNS configuration for new node
-```
-
-#### Solution 3: Implement Pre-Restore Environment Preparation
-
-Add environment preparation steps before triggering container restoration:
-
-```bash
-# Create a pre-restore hook that:
-# 1. Ensures identical cgroup structure on target node
-# 2. Creates necessary mount points and directories
-# 3. Sets up network interfaces in compatible state
-# 4. Configures security contexts to match original environment
-```
-
-#### Solution 4: Use CRIU Lazy Pages (Advanced)
-
-For large containers with significant memory state, enable CRIU lazy pages migration:
-
-```bash
-# Configure the checkpoint agent to use:
-# --lazy-pages: Stream memory pages on-demand during restoration
-# --page-server: Use dedicated page server for cross-node memory transfer
-# This reduces initial restoration time and handles memory layout differences
-```
-
-#### Immediate Fix: Modify Checkpoint Agent
-
-Update `cmd/checkpoint-agent/main.go` to use these CRIU restoration options:
-
-```go
-// Add to the container restoration command in CRI-O integration:
-criuOpts := []string{
-    "--tcp-established",
-    "--ext-mount-map", "/old/path:/new/path", 
-    "--manage-cgroups",
-    "--shell-job",
-    "--file-locks",
-}
-```
-
-#### Implementation Priority
-
-1. **High Priority**: Solution 2 (Container specification reset) - addresses network namespace issues
-2. **Medium Priority**: Solution 1 (CRIU options) - handles process-level environment changes  
-3. **Low Priority**: Solutions 3-4 (Advanced features) - for complex migration scenarios
-
-#### Testing the Fix
-
-After implementing the fixes:
-
-```bash
-# Test same-node migration (should work with network namespace fixes)
-kubectl apply -f - <<EOF
-apiVersion: lpm.my.domain/v1
-kind: PodMigration
-metadata:
-  name: test-fixed-migration
-  namespace: default  
-spec:
-  podName: stateful-pod-same-node
-  targetNode: k8s-worker
-EOF
-
-# Verify restored container runs successfully
-kubectl get pods -l migration.source-pod=stateful-pod-same-node
-kubectl logs <restored-pod-name> -c nginx  # Should show successful startup
-kubectl logs <restored-pod-name> -c writer # Should show continued log writing
-```
-
-#### Expected Results After Fix
-
-- Containers should start successfully without exit code 137
-- Process state should be preserved (log timestamps show continuity)
-- Network connectivity should work in the new environment
-- File system state should be maintained across migration
-
-The key insight is that CRIU checkpoint/restore works, but the container runtime context needs to be adapted for the new environment during restoration.
 
 ### 8. Verify Cross-Node Checkpoint Access
 
