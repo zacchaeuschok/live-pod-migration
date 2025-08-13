@@ -37,7 +37,11 @@ The Live Pod Migration Controller implements a complete control-plane and node a
 
 ## Demo
 
-🎥 **[View Live Pod Migration Demo](public/lpm.mov)** - See the system in action with real-time process state preservation across nodes.
+🎥 **Live Pod Migration in Action** - Watch real-time process state preservation across Kubernetes nodes:
+
+[![Live Pod Migration Demo](https://img.youtube.com/vi/-9zZG_GNruo/0.jpg)](https://www.youtube.com/watch?v=-9zZG_GNruo)
+
+*Click the thumbnail above to see the complete migration workflow with counter state preservation.*
 
 ## Quick Start
 
