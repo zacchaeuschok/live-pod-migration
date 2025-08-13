@@ -1,6 +1,6 @@
 # Live Pod Migration Controller
 
-A Kubernetes controller that enables live migration of running pods between cluster nodes using CRIU (Checkpoint/Restore In Userspace) technology. The system performs checkpoint operations on source nodes and restores pod state on destination nodes with minimal downtime.
+A Kubernetes-native controller that enables live migration of running pods between cluster nodes using CRIU (Checkpoint/Restore In Userspace) technology. The system performs checkpoint operations on source nodes and restores pod state on destination nodes while preserving process memory, file descriptors, and application state.
 
 ## Description
 
@@ -14,11 +14,11 @@ The Live Pod Migration Controller implements a complete control-plane and node a
 
 ### Key Features
 
-- **Minimal Downtime**: Live migration preserves application state with checkpoint/restore technology
-- **Declarative API**: Kubernetes-native CRDs for `PodCheckpoint`, `ContainerCheckpoint`, and migration resources
-- **Cross-Node Mobility**: Move workloads between nodes for maintenance, load balancing, or resource optimization
-- **CRIU Integration**: Leverages mature CRIU technology for reliable process state capture
-- **Production Ready**: Comprehensive error handling, status reporting, and operational observability
+- **Process State Preservation**: Maintains running processes, memory contents, and file descriptors across migration
+- **Kubernetes-Native**: Uses standard CRDs and APIs without requiring kubelet or container runtime modifications  
+- **Cross-Node Migration**: Supports pod movement between any nodes in the cluster
+- **CRIU Integration**: Leverages CRIU checkpoint/restore technology with OCI image packaging
+- **Shared Storage**: NFS-based checkpoint storage enables cross-node restoration
 
 ### Architecture Components
 
@@ -49,18 +49,18 @@ For a complete setup guide including CRIU configuration and testing instructions
 
 ### Basic Workflow
 
-1. **Deploy the system** on a Kubernetes cluster with CRIU support
-2. **Create a checkpoint** of a running pod:
+1. **Create a pod migration** to move a running pod between nodes:
    ```yaml
    apiVersion: lpm.my.domain/v1
-   kind: PodCheckpoint
+   kind: PodMigration
    metadata:
-     name: my-app-checkpoint
+     name: my-migration
    spec:
      podName: my-app-pod
+     targetNode: target-node-name
    ```
-3. **Monitor progress** with `kubectl get podcheckpoint my-app-checkpoint -w`
-4. **Use checkpoint artifacts** for migration or backup scenarios
+2. **Monitor progress** with `kubectl get podmigration my-migration -w`
+3. **Verify restored pod** maintains application state from checkpoint
 
 ## Project Structure
 
@@ -86,125 +86,28 @@ For a complete setup guide including CRIU configuration and testing instructions
 
 ## Getting Started
 
+For complete installation, configuration, and testing instructions, see **[README-TESTING.md](./README-TESTING.md)**.
+
 ### Prerequisites
-- go version v1.23.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/live-pod-migration-controller:tag
-```
-
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
-make install
-```
-
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
-make deploy IMG=<some-registry>/live-pod-migration-controller:tag
-```
-
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/live-pod-migration-controller:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/live-pod-migration-controller/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v1-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
+- Kubernetes cluster with CRIU 4.1.1+ support
+- CRIO container runtime with checkpoint feature enabled
+- Shared storage (NFS) for cross-node checkpoint access
 
 ## Roadmap
 
-### Current Features (v0.1)
-- ✅ Container-level checkpointing via kubelet API
-- ✅ Pod-level checkpoint orchestration  
-- ✅ Local checkpoint storage
-- ✅ gRPC agent communication
-- ✅ Comprehensive testing framework
+### Current Features (v1.0)
+- ✅ **Live Pod Migration**: Complete cross-node migration with process state preservation
+- ✅ **Container Checkpointing**: Individual container checkpoint/restore via kubelet API
+- ✅ **Pod-Level Migration**: Multi-container pod migration orchestration
+- ✅ **OCI Image Integration**: Checkpoint packaging as standard OCI images  
+- ✅ **Shared Storage**: NFS-based checkpoint storage for cross-node access
+- ✅ **CRI-O Integration**: Automatic checkpoint restoration via container runtime annotations
 
-### Planned Features
-- 🔄 **Shared Storage Integration**: PVC-based checkpoint artifact sharing
-- 🔄 **Pod Restore Operations**: Complete migration workflow with destination restore
+### Planned Features  
 - 🔄 **Incremental Checkpoints**: Delta-based storage for large containers
 - 🔄 **Cross-Cluster Migration**: Portable checkpoints for disaster recovery
 - 🔄 **Performance Optimization**: Compression, deduplication, and streaming
+- 🔄 **Network State Migration**: Advanced TCP connection restoration
 
 ### Long-term Vision
 - 🎯 **Production Hardening**: HA storage, encryption, multi-tenancy
@@ -228,9 +131,7 @@ We welcome contributions! This project is part of CP4101 coursework but aims to 
 - **Performance**: Optimize checkpoint/restore performance
 - **Security**: Enhance multi-tenancy and encryption features
 
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+For detailed development and testing instructions, see [README-TESTING.md](./README-TESTING.md).
 
 ## License
 
