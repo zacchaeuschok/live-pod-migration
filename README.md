@@ -35,6 +35,10 @@ The Live Pod Migration Controller implements a complete control-plane and node a
 - **Disaster Recovery**: Create portable checkpoints for cross-cluster recovery scenarios
 - **Development/Testing**: Capture and replay application states for debugging and testing
 
+## Demo
+
+🎥 **[View Live Pod Migration Demo](public/lpm.mov)** - See the system in action with real-time process state preservation across nodes.
+
 ## Quick Start
 
 For a complete setup guide including CRIU configuration and testing instructions, see [README-TESTING.md](./README-TESTING.md).
