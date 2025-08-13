@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,8 +30,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"my.domain/guestbook/internal/agent"
 	lpmv1 "my.domain/guestbook/api/v1"
+	"my.domain/guestbook/internal/agent"
 )
 
 // PodMigrationReconciler reconciles a PodMigration object
@@ -70,6 +69,8 @@ func (r *PodMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.handleCheckpointingPhase(ctx, &podMigration)
 	case lpmv1.MigrationPhaseCheckpointComplete:
 		return r.handleCheckpointCompletePhase(ctx, &podMigration)
+	case lpmv1.MigrationPhasePreparingImages:
+		return r.handlePreparingImagesPhase(ctx, &podMigration)
 	case lpmv1.MigrationPhaseRestoring:
 		return r.handleRestoringPhase(ctx, &podMigration)
 	case lpmv1.MigrationPhaseSucceeded, lpmv1.MigrationPhaseFailed:
@@ -227,42 +228,118 @@ func (r *PodMigrationReconciler) handleCheckpointCompletePhase(ctx context.Conte
 	logger := log.FromContext(ctx)
 	logger.Info("Handling CheckpointComplete phase for PodMigration", "name", podMigration.Name)
 
-	// Create restored pod from checkpoint
-	restoredPod, err := r.createRestoredPod(ctx, podMigration)
-	if err != nil {
-		return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, fmt.Sprintf("failed to create restored pod: %v", err))
-	}
-
-	err = r.Create(ctx, restoredPod)
-	if err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			logger.Info("Restored pod already exists", "pod", restoredPod.Name)
-		} else {
-			return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, fmt.Sprintf("failed to create restored pod: %v", err))
-		}
-	}
-
-	// Update status with restored pod name and move to restoring phase
-	podMigration.Status.RestoredPodName = restoredPod.Name
-	podMigration.Status.Phase = lpmv1.MigrationPhaseRestoring
-	podMigration.Status.Message = "restored pod created"
+	// Move to preparing images phase
+	podMigration.Status.Phase = lpmv1.MigrationPhasePreparingImages
+	podMigration.Status.Message = "preparing checkpoint images"
 	if err := r.Status().Update(ctx, podMigration); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Restored pod created", "pod", restoredPod.Name)
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+}
+
+func (r *PodMigrationReconciler) handlePreparingImagesPhase(ctx context.Context, podMigration *lpmv1.PodMigration) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Handling PreparingImages phase for PodMigration", "name", podMigration.Name)
+
+	// Get checkpoint content to find container checkpoints
+	checkpointContent, err := r.getCheckpointContent(ctx, podMigration)
+	if err != nil {
+		return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, fmt.Sprintf("failed to get checkpoint content: %v", err))
+	}
+
+	// Get original pod to know what containers we need images for
+	var originalPod corev1.Pod
+	err = r.Get(ctx, client.ObjectKey{
+		Namespace: podMigration.Namespace,
+		Name:      podMigration.Spec.PodName,
+	}, &originalPod)
+	if err != nil {
+		return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, fmt.Sprintf("failed to get original pod: %v", err))
+	}
+
+	// Convert all container checkpoints to OCI images
+	if podMigration.Status.CheckpointImages == nil {
+		podMigration.Status.CheckpointImages = make(map[string]string)
+	}
+
+	imagesReady := true
+	for _, container := range originalPod.Spec.Containers {
+		// Check if image already prepared
+		if _, exists := podMigration.Status.CheckpointImages[container.Name]; exists {
+			continue
+		}
+
+		// Get checkpoint path for this container
+		checkpointPath := r.getCheckpointPathForContainer(ctx, checkpointContent, container.Name)
+		if checkpointPath == "" {
+			return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, fmt.Sprintf("no checkpoint found for container %s", container.Name))
+		}
+
+		// Convert to OCI image
+		checkpointImage, err := r.convertToOCIImage(ctx, checkpointPath, container.Name, podMigration.Spec.TargetNode)
+		if err != nil {
+			logger.Error(err, "Failed to convert checkpoint to OCI image", "container", container.Name)
+			imagesReady = false
+			continue
+		}
+
+		// Store the image reference
+		podMigration.Status.CheckpointImages[container.Name] = checkpointImage
+		logger.Info("Checkpoint image prepared", "container", container.Name, "image", checkpointImage)
+	}
+
+	// Update status with current image state
+	if err := r.Status().Update(ctx, podMigration); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// If all images are ready, move to restoring phase
+	if imagesReady && len(podMigration.Status.CheckpointImages) == len(originalPod.Spec.Containers) {
+		podMigration.Status.Phase = lpmv1.MigrationPhaseRestoring
+		podMigration.Status.Message = "checkpoint images ready, creating restored pod"
+		if err := r.Status().Update(ctx, podMigration); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+
+	// Still preparing images, requeue to continue
+	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 }
 
 func (r *PodMigrationReconciler) handleRestoringPhase(ctx context.Context, podMigration *lpmv1.PodMigration) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Handling Restoring phase for PodMigration", "name", podMigration.Name)
 
-	// Check restored pod status
+	// Create restored pod if not already created
 	if podMigration.Status.RestoredPodName == "" {
-		return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, "no restored pod name in status")
+		restoredPod, err := r.createRestoredPod(ctx, podMigration)
+		if err != nil {
+			return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, fmt.Sprintf("failed to create restored pod: %v", err))
+		}
+
+		err = r.Create(ctx, restoredPod)
+		if err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				logger.Info("Restored pod already exists", "pod", restoredPod.Name)
+			} else {
+				return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, fmt.Sprintf("failed to create restored pod: %v", err))
+			}
+		}
+
+		// Update status with restored pod name
+		podMigration.Status.RestoredPodName = restoredPod.Name
+		podMigration.Status.Message = "restored pod created"
+		if err := r.Status().Update(ctx, podMigration); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		logger.Info("Restored pod created", "pod", restoredPod.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	// Check restored pod status
 	var restoredPod corev1.Pod
 	err := r.Get(ctx, client.ObjectKey{
 		Name:      podMigration.Status.RestoredPodName,
@@ -284,14 +361,14 @@ func (r *PodMigrationReconciler) handleRestoringPhase(ctx context.Context, podMi
 			logger.Error(err, "Failed to delete original pod, but migration succeeded")
 		}
 		return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseSucceeded, "pod successfully restored and running")
-	
+
 	case corev1.PodFailed:
 		return ctrl.Result{}, r.updatePhase(ctx, podMigration, lpmv1.MigrationPhaseFailed, "restored pod failed to start")
-	
+
 	case corev1.PodPending:
 		logger.Info("Restored pod is pending", "pod", restoredPod.Name, "reason", restoredPod.Status.Reason)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	
+
 	default:
 		logger.Info("Restored pod in progress", "pod", restoredPod.Name, "phase", restoredPod.Status.Phase)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -334,8 +411,8 @@ func (r *PodMigrationReconciler) createRestoredPod(ctx context.Context, podMigra
 			Namespace: originalPod.Namespace,
 			Labels:    originalPod.Labels,
 			Annotations: map[string]string{
-				"migration.source-pod":       originalPod.Name,
-				"migration.target-node":      podMigration.Spec.TargetNode,
+				"migration.source-pod":        originalPod.Name,
+				"migration.target-node":       podMigration.Spec.TargetNode,
 				"migration.checkpoint-source": checkpointContent.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
@@ -347,36 +424,27 @@ func (r *PodMigrationReconciler) createRestoredPod(ctx context.Context, podMigra
 			RestartPolicy:      corev1.RestartPolicyNever,
 			ServiceAccountName: originalPod.Spec.ServiceAccountName,
 			SecurityContext:    originalPod.Spec.SecurityContext,
-			Volumes:           originalPod.Spec.Volumes,
-			Containers:        make([]corev1.Container, len(originalPod.Spec.Containers)),
+			Volumes:            originalPod.Spec.Volumes,
+			Containers:         make([]corev1.Container, len(originalPod.Spec.Containers)),
 		},
 	}
 
 	for i, container := range originalPod.Spec.Containers {
 		restoredContainer := container.DeepCopy()
-		
-		checkpointPath := r.getCheckpointPathForContainer(ctx, checkpointContent, container.Name)
-		if checkpointPath == "" {
-			return nil, fmt.Errorf("no checkpoint found for container %s", container.Name)
+
+		// Use pre-prepared checkpoint images from PreparingImages phase
+		if podMigration.Status.CheckpointImages == nil {
+			return nil, fmt.Errorf("checkpoint images not prepared for migration")
 		}
-		
-		// Use checkpoint file path directly for CRI-O auto-restoration
-		// CRI-O automatically detects checkpoint files when container.image is a file path
-		var checkpointFilePath string
-		if strings.HasPrefix(checkpointPath, "shared://") {
-			// Convert shared:// URI to local file path
-			filename := strings.TrimPrefix(checkpointPath, "shared://")
-			checkpointFilePath = filepath.Join("/mnt/checkpoints", filename)
-		} else if strings.HasPrefix(checkpointPath, "file://") {
-			// Use local file path directly
-			checkpointFilePath = strings.TrimPrefix(checkpointPath, "file://")
-		} else {
-			return nil, fmt.Errorf("unsupported checkpoint path format: %s", checkpointPath)
+
+		checkpointImage, exists := podMigration.Status.CheckpointImages[container.Name]
+		if !exists {
+			return nil, fmt.Errorf("no checkpoint image prepared for container %s", container.Name)
 		}
-		
-		restoredContainer.Image = checkpointFilePath
+
+		restoredContainer.Image = checkpointImage
 		restoredContainer.ImagePullPolicy = corev1.PullNever
-		
+
 		restoredPod.Spec.Containers[i] = *restoredContainer
 	}
 
@@ -389,7 +457,7 @@ func (r *PodMigrationReconciler) getCheckpointContent(ctx context.Context, podMi
 	}
 
 	checkpointName := podMigration.Status.PodCheckpointRef.Name
-	
+
 	var podCheckpoint lpmv1.PodCheckpoint
 	err := r.Get(ctx, client.ObjectKey{
 		Namespace: podMigration.Namespace,
@@ -425,7 +493,7 @@ func (r *PodMigrationReconciler) getCheckpointPathForContainer(ctx context.Conte
 		if err != nil {
 			continue
 		}
-		
+
 		if strings.Contains(content.Name, containerName) {
 			return content.Spec.ArtifactURI
 		}
@@ -457,7 +525,7 @@ func (r *PodMigrationReconciler) deleteOriginalPod(ctx context.Context, podMigra
 		Namespace: podMigration.Namespace,
 		Name:      podMigration.Spec.PodName,
 	}, &originalPod)
-	
+
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
