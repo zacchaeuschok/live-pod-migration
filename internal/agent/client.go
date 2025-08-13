@@ -65,12 +65,12 @@ func (c *Client) CheckpointContainer(ctx context.Context, nodeName, podNamespace
 	return resp.ArtifactUri, nil
 }
 
-// RestoreContainer performs a restore operation on a container
-func (c *Client) RestoreContainer(ctx context.Context, nodeName, artifactURI, podNamespace, podName, containerName, podUID string) error {
+// ConvertCheckpointToImage converts a checkpoint file to OCI image format
+func (c *Client) ConvertCheckpointToImage(ctx context.Context, nodeName, checkpointPath, containerName, imageName string) (string, error) {
 	// Create gRPC connection to agent
 	conn, err := c.dialAgent(ctx, nodeName)
 	if err != nil {
-		return fmt.Errorf("failed to connect to agent on node %s: %w", nodeName, err)
+		return "", fmt.Errorf("failed to connect to agent on node %s: %w", nodeName, err)
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
@@ -81,26 +81,25 @@ func (c *Client) RestoreContainer(ctx context.Context, nodeName, artifactURI, po
 	// Create checkpoint service client
 	checkpointClient := pb.NewCheckpointServiceClient(conn)
 
-	// Perform restore
-	req := &pb.RestoreRequest{
-		ArtifactUri:   artifactURI,
-		PodNamespace:  podNamespace,
-		PodName:       podName,
-		ContainerName: containerName,
-		PodUid:        podUID,
+	// Perform conversion
+	req := &pb.ConvertRequest{
+		CheckpointPath: checkpointPath,
+		ContainerName:  containerName,
+		ImageName:      imageName,
 	}
 
-	resp, err := checkpointClient.Restore(ctx, req)
+	resp, err := checkpointClient.ConvertCheckpointToImage(ctx, req)
 	if err != nil {
-		return fmt.Errorf("restore RPC failed: %w", err)
+		return "", fmt.Errorf("convert RPC failed: %w", err)
 	}
 
 	if !resp.Success {
-		return fmt.Errorf("restore failed: %s", resp.Error)
+		return "", fmt.Errorf("conversion failed: %s", resp.Error)
 	}
 
-	return nil
+	return resp.ImageReference, nil
 }
+
 
 // getNodeEndpoint gets the agent endpoint using node IP
 func (c *Client) getNodeEndpoint(ctx context.Context, nodeName string) (string, error) {

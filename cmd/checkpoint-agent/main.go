@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -102,8 +103,22 @@ func (s *CheckpointServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 		}, nil
 	}
 
-	// Return the first checkpoint file as the artifact URI
-	artifactURI := fmt.Sprintf("file://%s", checkpointFiles[0])
+	// Copy checkpoint to shared storage
+	sharedPath, err := s.copyToSharedStorage(req.PodUid, req.ContainerName, checkpointFiles[0])
+	if err != nil {
+		log.Printf("Failed to copy to shared storage: %v", err)
+		// Return local path as fallback
+		artifactURI := fmt.Sprintf("file://%s", checkpointFiles[0])
+		log.Printf("Checkpoint created successfully: %s", artifactURI)
+		return &pb.CheckpointResponse{
+			Success:     true,
+			ArtifactUri: artifactURI,
+			Message:     "checkpoint created successfully",
+		}, nil
+	}
+
+	// Return shared path
+	artifactURI := fmt.Sprintf("shared://%s", sharedPath)
 	log.Printf("Checkpoint created successfully: %s", artifactURI)
 	return &pb.CheckpointResponse{
 		Success:     true,
@@ -112,25 +127,57 @@ func (s *CheckpointServer) Checkpoint(ctx context.Context, req *pb.CheckpointReq
 	}, nil
 }
 
-// Restore implements the restore operation
-func (s *CheckpointServer) Restore(ctx context.Context, req *pb.RestoreRequest) (*pb.RestoreResponse, error) {
-	log.Printf("Restore request: uri=%s, namespace=%s, pod=%s, container=%s", 
-		req.ArtifactUri, req.PodNamespace, req.PodName, req.ContainerName)
 
-	// For now, just validate the restore request
-	// Full restore implementation would require coordination with kubelet/CRI
-	if err := s.validateRestoreRequest(req); err != nil {
-		log.Printf("Failed to validate restore request: %v", err)
-		return &pb.RestoreResponse{
+// ConvertCheckpointToImage converts a checkpoint tar file to OCI image format
+func (s *CheckpointServer) ConvertCheckpointToImage(ctx context.Context, req *pb.ConvertRequest) (*pb.ConvertResponse, error) {
+	log.Printf("Convert request: checkpoint_path=%s, container_name=%s, image_name=%s", 
+		req.CheckpointPath, req.ContainerName, req.ImageName)
+
+	// Validate input
+	if req.CheckpointPath == "" {
+		return &pb.ConvertResponse{
 			Success: false,
-			Error:   fmt.Sprintf("restore validation failed: %v", err),
+			Error:   "checkpoint path is required",
 		}, nil
 	}
 
-	log.Printf("Restore validation completed successfully")
-	return &pb.RestoreResponse{
-		Success: true,
-		Message: "restore validation completed successfully",
+	if req.ImageName == "" {
+		return &pb.ConvertResponse{
+			Success: false,
+			Error:   "image name is required",
+		}, nil
+	}
+
+	// Convert shared:// URI to local path
+	checkpointPath := req.CheckpointPath
+	if strings.HasPrefix(checkpointPath, "shared://") {
+		filename := strings.TrimPrefix(checkpointPath, "shared://")
+		checkpointPath = filepath.Join("/mnt/checkpoints", filename)
+	}
+
+	// Verify checkpoint file exists
+	if _, err := os.Stat(checkpointPath); os.IsNotExist(err) {
+		return &pb.ConvertResponse{
+			Success: false,
+			Error:   fmt.Sprintf("checkpoint file not found: %s", checkpointPath),
+		}, nil
+	}
+
+	// Convert checkpoint to OCI image using buildah
+	imageRef, err := s.convertCheckpointToOCI(checkpointPath, req.ContainerName, req.ImageName)
+	if err != nil {
+		log.Printf("Failed to convert checkpoint to OCI: %v", err)
+		return &pb.ConvertResponse{
+			Success: false,
+			Error:   fmt.Sprintf("conversion failed: %v", err),
+		}, nil
+	}
+
+	log.Printf("Successfully converted checkpoint to OCI image: %s", imageRef)
+	return &pb.ConvertResponse{
+		Success:        true,
+		ImageReference: imageRef,
+		Message:        "checkpoint successfully converted to OCI image",
 	}, nil
 }
 
@@ -144,23 +191,83 @@ func (s *CheckpointServer) Health(_ context.Context, _ *pb.HealthRequest) (*pb.H
 
 // makeTLSClient creates an HTTP client with TLS configuration for kubelet
 func (s *CheckpointServer) makeTLSClient() (*http.Client, error) {
-	cert, err := tls.LoadX509KeyPair(checkpointCertFile, checkpointKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load client certificate: %w", err)
+	// Try different certificate path combinations
+	certPaths := []struct {
+		cert string
+		key  string
+		ca   string
+		desc string
+	}{
+		// Worker node paths (kubelet auto-generated)
+		{
+			cert: "/var/lib/kubelet/pki/kubelet-client-current.pem",
+			key:  "/var/lib/kubelet/pki/kubelet-client-current.pem",
+			ca:   "/etc/kubernetes/pki/ca.crt",
+			desc: "worker node (kubelet auto-generated)",
+		},
+		// Master node paths (kubeadm generated)
+		{
+			cert: "/etc/kubernetes/pki/apiserver-kubelet-client.crt",
+			key:  "/etc/kubernetes/pki/apiserver-kubelet-client.key",
+			ca:   "/etc/kubernetes/pki/ca.crt",
+			desc: "master node (kubeadm generated)",
+		},
+		// Alternative master node paths
+		{
+			cert: "/etc/kubernetes/pki/apiserver-kubelet-client.crt",
+			key:  "/etc/kubernetes/pki/apiserver-kubelet-client.key",
+			ca:   "/var/lib/kubelet/pki/kubelet.crt",
+			desc: "master node (alternative CA)",
+		},
 	}
-
-	caBytes, err := os.ReadFile(checkpointCAFile)
-	if err != nil {
-		// Try alternative CA path
-		caBytes, err = os.ReadFile("/etc/kubernetes/pki/ca.crt")
-		if err != nil {
-			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+	
+	var cert tls.Certificate
+	var caBytes []byte
+	var err error
+	var workingPaths string
+	
+	// Try each certificate path combination
+	for _, paths := range certPaths {
+		// Check if all required files exist
+		if _, err := os.Stat(paths.cert); os.IsNotExist(err) {
+			log.Printf("Certificate file not found: %s", paths.cert)
+			continue
 		}
+		if _, err := os.Stat(paths.key); os.IsNotExist(err) {
+			log.Printf("Key file not found: %s", paths.key)
+			continue
+		}
+		if _, err := os.Stat(paths.ca); os.IsNotExist(err) {
+			log.Printf("CA file not found: %s", paths.ca)
+			continue
+		}
+		
+		// Try to load the certificate
+		cert, err = tls.LoadX509KeyPair(paths.cert, paths.key)
+		if err != nil {
+			log.Printf("Failed to load certificates from %s/%s (%s): %v", paths.cert, paths.key, paths.desc, err)
+			continue
+		}
+		
+		// Try to load the CA
+		caBytes, err = os.ReadFile(paths.ca)
+		if err != nil {
+			log.Printf("Failed to load CA from %s (%s): %v", paths.ca, paths.desc, err)
+			continue
+		}
+		
+		workingPaths = fmt.Sprintf("%s (cert=%s, key=%s, ca=%s)", paths.desc, paths.cert, paths.key, paths.ca)
+		log.Printf("Successfully loaded certificates: %s", workingPaths)
+		break
+	}
+	
+	if err != nil {
+		return nil, fmt.Errorf("failed to load client certificate from any known location: %w", err)
 	}
 
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caBytes) {
-		return nil, fmt.Errorf("failed to parse CA certificate")
+		return nil, fmt.Errorf("failed to parse CA certificate from %s", workingPaths)
 	}
 
 	return &http.Client{
@@ -243,28 +350,6 @@ func (s *CheckpointServer) doCheckpointWithBackoff(ctx context.Context, httpClie
 	return checkpointFiles, nil
 }
 
-// validateRestoreRequest validates a restore request
-func (s *CheckpointServer) validateRestoreRequest(req *pb.RestoreRequest) error {
-	if req.ArtifactUri == "" {
-		return fmt.Errorf("artifact URI is required")
-	}
-	if req.PodNamespace == "" {
-		return fmt.Errorf("pod namespace is required")
-	}
-	if req.PodName == "" {
-		return fmt.Errorf("pod name is required")
-	}
-	if req.ContainerName == "" {
-		return fmt.Errorf("container name is required")
-	}
-	
-	// Validate artifact URI format
-	if !filepath.IsAbs(req.ArtifactUri) && !strings.HasPrefix(req.ArtifactUri, "file://") {
-		return fmt.Errorf("invalid artifact URI format")
-	}
-	
-	return nil
-}
 
 func main() {
 	log.Printf("Starting checkpoint agent on node %s", os.Getenv("NODE_NAME"))
@@ -312,4 +397,82 @@ func main() {
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
+}
+
+// convertCheckpointToOCI converts a checkpoint tar file to OCI image format using buildah
+func (s *CheckpointServer) convertCheckpointToOCI(checkpointPath, containerName, imageName string) (string, error) {
+	log.Printf("Converting checkpoint %s to OCI image %s", checkpointPath, imageName)
+
+	// Common buildah flags to use the mounted container storage
+	buildahFlags := []string{"--root", "/var/lib/containers/storage"}
+
+	// Create a working container from scratch
+	cmd := exec.Command("buildah", append(buildahFlags, "from", "scratch")...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to create working container: %v, output: %s", err, output)
+	}
+	
+	containerID := strings.TrimSpace(string(output))
+	log.Printf("Created working container: %s", containerID)
+
+	// Clean up working container on exit
+	defer func() {
+		cmd := exec.Command("buildah", append(buildahFlags, "rm", containerID)...)
+		if err := cmd.Run(); err != nil {
+			log.Printf("Warning: failed to remove working container %s: %v", containerID, err)
+		}
+	}()
+
+	// Add checkpoint file to container
+	cmd = exec.Command("buildah", append(buildahFlags, "add", containerID, checkpointPath, "/")...)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to add checkpoint to container: %v", err)
+	}
+
+	// Add checkpoint annotation
+	cmd = exec.Command("buildah", append(buildahFlags, "config", 
+		fmt.Sprintf("--annotation=io.kubernetes.cri-o.annotations.checkpoint.name=%s", containerName), 
+		containerID)...)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to add checkpoint annotation: %v", err)
+	}
+
+	// Commit the container as an image
+	cmd = exec.Command("buildah", append(buildahFlags, "commit", containerID, imageName)...)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to commit container as image: %v", err)
+	}
+
+	log.Printf("Successfully created OCI image: %s", imageName)
+	return imageName, nil
+}
+
+// copyToSharedStorage copies checkpoint to shared NFS mount
+func (s *CheckpointServer) copyToSharedStorage(podUID, containerName, localPath string) (string, error) {
+	// Simple path: /mnt/checkpoints/<podUID>-<container>-<timestamp>.tar
+	timestamp := time.Now().Format("20060102-150405")
+	filename := fmt.Sprintf("%s-%s-%s.tar", podUID, containerName, timestamp)
+	sharedPath := filepath.Join("/mnt/checkpoints", filename)
+	
+	// Copy file
+	sourceFile, err := os.Open(localPath)
+	if err != nil {
+		return "", err
+	}
+	defer sourceFile.Close()
+	
+	destFile, err := os.Create(sharedPath)
+	if err != nil {
+		return "", err
+	}
+	defer destFile.Close()
+	
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return "", err
+	}
+	
+	// Return relative path for shared:// URI
+	return filename, destFile.Sync()
 }

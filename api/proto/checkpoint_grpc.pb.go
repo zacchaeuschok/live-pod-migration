@@ -19,21 +19,21 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	CheckpointService_Checkpoint_FullMethodName = "/checkpoint.CheckpointService/Checkpoint"
-	CheckpointService_Restore_FullMethodName    = "/checkpoint.CheckpointService/Restore"
-	CheckpointService_Health_FullMethodName     = "/checkpoint.CheckpointService/Health"
+	CheckpointService_Checkpoint_FullMethodName               = "/checkpoint.CheckpointService/Checkpoint"
+	CheckpointService_ConvertCheckpointToImage_FullMethodName = "/checkpoint.CheckpointService/ConvertCheckpointToImage"
+	CheckpointService_Health_FullMethodName                   = "/checkpoint.CheckpointService/Health"
 )
 
 // CheckpointServiceClient is the client API for CheckpointService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// CheckpointService provides container checkpoint and restore operations
+// CheckpointService provides container checkpoint operations
 type CheckpointServiceClient interface {
 	// Checkpoint creates a checkpoint of a container
 	Checkpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
-	// Restore restores a container from a checkpoint
-	Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error)
+	// ConvertCheckpointToImage converts a checkpoint tar file to OCI image format
+	ConvertCheckpointToImage(ctx context.Context, in *ConvertRequest, opts ...grpc.CallOption) (*ConvertResponse, error)
 	// Health check for the service
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
 }
@@ -56,10 +56,10 @@ func (c *checkpointServiceClient) Checkpoint(ctx context.Context, in *Checkpoint
 	return out, nil
 }
 
-func (c *checkpointServiceClient) Restore(ctx context.Context, in *RestoreRequest, opts ...grpc.CallOption) (*RestoreResponse, error) {
+func (c *checkpointServiceClient) ConvertCheckpointToImage(ctx context.Context, in *ConvertRequest, opts ...grpc.CallOption) (*ConvertResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RestoreResponse)
-	err := c.cc.Invoke(ctx, CheckpointService_Restore_FullMethodName, in, out, cOpts...)
+	out := new(ConvertResponse)
+	err := c.cc.Invoke(ctx, CheckpointService_ConvertCheckpointToImage_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -80,12 +80,12 @@ func (c *checkpointServiceClient) Health(ctx context.Context, in *HealthRequest,
 // All implementations must embed UnimplementedCheckpointServiceServer
 // for forward compatibility.
 //
-// CheckpointService provides container checkpoint and restore operations
+// CheckpointService provides container checkpoint operations
 type CheckpointServiceServer interface {
 	// Checkpoint creates a checkpoint of a container
 	Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
-	// Restore restores a container from a checkpoint
-	Restore(context.Context, *RestoreRequest) (*RestoreResponse, error)
+	// ConvertCheckpointToImage converts a checkpoint tar file to OCI image format
+	ConvertCheckpointToImage(context.Context, *ConvertRequest) (*ConvertResponse, error)
 	// Health check for the service
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
 	mustEmbedUnimplementedCheckpointServiceServer()
@@ -101,8 +101,8 @@ type UnimplementedCheckpointServiceServer struct{}
 func (UnimplementedCheckpointServiceServer) Checkpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Checkpoint not implemented")
 }
-func (UnimplementedCheckpointServiceServer) Restore(context.Context, *RestoreRequest) (*RestoreResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Restore not implemented")
+func (UnimplementedCheckpointServiceServer) ConvertCheckpointToImage(context.Context, *ConvertRequest) (*ConvertResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ConvertCheckpointToImage not implemented")
 }
 func (UnimplementedCheckpointServiceServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Health not implemented")
@@ -146,20 +146,20 @@ func _CheckpointService_Checkpoint_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _CheckpointService_Restore_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RestoreRequest)
+func _CheckpointService_ConvertCheckpointToImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConvertRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(CheckpointServiceServer).Restore(ctx, in)
+		return srv.(CheckpointServiceServer).ConvertCheckpointToImage(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: CheckpointService_Restore_FullMethodName,
+		FullMethod: CheckpointService_ConvertCheckpointToImage_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(CheckpointServiceServer).Restore(ctx, req.(*RestoreRequest))
+		return srv.(CheckpointServiceServer).ConvertCheckpointToImage(ctx, req.(*ConvertRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -194,8 +194,8 @@ var CheckpointService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _CheckpointService_Checkpoint_Handler,
 		},
 		{
-			MethodName: "Restore",
-			Handler:    _CheckpointService_Restore_Handler,
+			MethodName: "ConvertCheckpointToImage",
+			Handler:    _CheckpointService_ConvertCheckpointToImage_Handler,
 		},
 		{
 			MethodName: "Health",

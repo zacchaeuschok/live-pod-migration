@@ -230,7 +230,7 @@ func (r *PodCheckpointReconciler) handleCheckpointingPhase(ctx context.Context, 
 
 	// 4. Confirm PodCheckpointContent ready
 	var boundContent lpmv1.PodCheckpointContent
-	if err := r.Get(ctx, client.ObjectKey{Name: podCheckpoint.Status.BoundContentName}, &boundContent); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: podCheckpoint.Status.BoundContentName, Namespace: podCheckpoint.Namespace}, &boundContent); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}

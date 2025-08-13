@@ -4,13 +4,13 @@ package checkpoint;
 
 option go_package = "my.domain/guestbook/api/proto";
 
-// CheckpointService provides container checkpoint and restore operations
+// CheckpointService provides container checkpoint operations
 service CheckpointService {
   // Checkpoint creates a checkpoint of a container
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
   
-  // Restore restores a container from a checkpoint
-  rpc Restore(RestoreRequest) returns (RestoreResponse);
+  // ConvertCheckpointToImage converts a checkpoint tar file to OCI image format
+  rpc ConvertCheckpointToImage(ConvertRequest) returns (ConvertResponse);
   
   // Health check for the service
   rpc Health(HealthRequest) returns (HealthResponse);
@@ -32,20 +32,19 @@ message CheckpointResponse {
   string error = 4;
 }
 
-// RestoreRequest contains the information needed to restore a container
-message RestoreRequest {
-  string artifact_uri = 1;
-  string pod_namespace = 2;
-  string pod_name = 3;
-  string container_name = 4;
-  string pod_uid = 5;
+// ConvertRequest contains the information needed to convert a checkpoint to OCI image
+message ConvertRequest {
+  string checkpoint_path = 1;
+  string container_name = 2;
+  string image_name = 3;
 }
 
-// RestoreResponse contains the result of a restore operation
-message RestoreResponse {
+// ConvertResponse contains the result of a checkpoint to OCI image conversion
+message ConvertResponse {
   bool success = 1;
-  string message = 2;
-  string error = 3;
+  string image_reference = 2;
+  string message = 3;
+  string error = 4;
 }
 
 // HealthRequest for health checks

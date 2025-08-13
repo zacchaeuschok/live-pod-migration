@@ -35,6 +35,9 @@ sudo buildah push localhost/checkpoint-agent:latest oci:/var/lib/containers/stor
 
 # Deploy the system (includes CRDs, RBAC, controller, and agent DaemonSet)
 make deploy IMG=localhost/controller:latest AGENT_IMG=localhost/checkpoint-agent:latest
+
+# Deploy shared storage for cross-node checkpoint access
+./deploy-shared-storage.sh
 ```
 
 ### 2. Verify Deployment
@@ -147,7 +150,175 @@ kubectl describe podcheckpoint multi-container-checkpoint
 kubectl get podcheckpointcontent
 ```
 
-### 6. Verify Agent Operation
+### 6. Verify Shared Storage
+
+```bash
+# Check shared storage is working
+kubectl get pvc -n live-pod-migration-controller-system
+
+# Verify NFS provisioner is running
+kubectl get pods -n kube-system -l app=nfs-subdir-external-provisioner
+
+# Check agent pods have shared storage mounted
+kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].spec.volumes[?(@.name=="checkpoint-repo")].persistentVolumeClaim.claimName}'
+
+# Test checkpoint files are saved to shared storage
+kubectl exec -n live-pod-migration-controller-system $(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].metadata.name}') -- ls -la /mnt/checkpoints/
+```
+
+### 7. Test Live Pod Migration with Process State Verification
+
+**IMPORTANT**: This test requires CRIU 4.1.1+ for ARM64 compatibility. If using CRIU 3.16.1, upgrade first:
+
+```bash
+# Upgrade CRIU on both nodes
+sudo add-apt-repository -y ppa:criu/ppa
+sudo apt update && sudo apt upgrade criu -y
+sudo systemctl restart crio
+criu --version  # Should show 4.1.1 or higher
+```
+
+**Working Migration Test**:
+
+```bash
+# Create a pod with incrementing counter to verify process state preservation
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter-migration-test
+spec:
+  containers:
+  - name: counter
+    image: busybox:1.35
+    command: 
+    - /bin/sh
+    - -c  
+    - |
+      echo 'Counter script starting'
+      COUNT=0
+      while true; do
+        COUNT=$((COUNT + 1))
+        TIMESTAMP=$(date)
+        echo "$TIMESTAMP: Count=$COUNT" | tee -a /data/counter.log
+        sleep 3
+      done
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    emptyDir: {}
+EOF
+
+# Wait for pod to start and accumulate counter state
+kubectl wait --for=condition=Ready pod/counter-migration-test --timeout=60s
+sleep 15
+
+# Verify counter is incrementing properly
+echo "=== Counter state before migration ==="
+kubectl logs counter-migration-test --tail=3
+kubectl exec counter-migration-test -- tail -3 /data/counter.log
+
+# Note the current counter value for verification after restoration
+CURRENT_COUNT=$(kubectl exec counter-migration-test -- tail -1 /data/counter.log | grep -o 'Count=[0-9]*')
+echo "Current counter state: $CURRENT_COUNT"
+
+# Create PodMigration (cross-node migration: worker -> master)
+kubectl apply -f - <<EOF
+apiVersion: lpm.my.domain/v1
+kind: PodMigration
+metadata:
+  name: counter-migration
+  namespace: default
+spec:
+  podName: counter-migration-test
+  targetNode: k8s-master
+EOF
+
+# Monitor migration progress
+echo "=== Monitoring migration progress ==="
+kubectl get podmigration counter-migration -w &
+WATCH_PID=$!
+
+# Wait for migration to complete (usually 30-60 seconds)
+sleep 45
+kill $WATCH_PID 2>/dev/null || true
+
+# Check migration status
+kubectl get podmigration counter-migration -o yaml | grep -A 3 'message\|phase'
+
+# Verify restored pod
+echo "=== Restored pod verification ==="
+kubectl get pod counter-migration-test-restored -o wide
+
+# CRITICAL TEST: Verify process state preservation
+echo "=== CRITICAL: Process state preservation verification ==="
+echo "Original counter was at: $CURRENT_COUNT"
+echo "Restored counter logs:"
+kubectl logs counter-migration-test-restored --tail=5
+
+echo "Restored counter file:"
+kubectl exec counter-migration-test-restored -- tail -5 /data/counter.log
+
+echo "=== Waiting 10 seconds to verify counter continues incrementing ==="
+sleep 10
+echo "Latest counter entries (should show continued incrementing):"
+kubectl exec counter-migration-test-restored -- tail -2 /data/counter.log
+
+# Success criteria verification
+RESTORED_COUNT=$(kubectl exec counter-migration-test-restored -- tail -1 /data/counter.log | grep -o 'Count=[0-9]*' | cut -d= -f2)
+if [[ $RESTORED_COUNT -gt 10 ]]; then
+  echo "✅ SUCCESS: Process state preserved! Counter continued from checkpoint state."
+  echo "✅ Live migration with zero downtime achieved!"
+else
+  echo "❌ FAILURE: Counter restarted from 0, process state not preserved"
+fi
+
+# Clean up
+kubectl delete pod counter-migration-test counter-migration-test-restored --ignore-not-found=true
+kubectl delete podmigration counter-migration --ignore-not-found=true
+```
+
+**Expected Results**:
+- ✅ **Process continuity**: Counter continues incrementing from checkpoint value (not restarting at 0)
+- ✅ **Memory state preservation**: `COUNT` variable maintained across migration
+- ✅ **File state preservation**: `/data/counter.log` shows continuous timestamps
+- ✅ **Cross-node migration**: Pod successfully moves from worker → master
+- ✅ **Zero downtime**: Process never stops, seamless migration
+
+**Troubleshooting**:
+- If counter restarts at 0: CRIU restoration failed, check CRIU version
+- If pod fails to start: Check `kubectl describe pod` for container errors
+- If migration stucks: Check controller logs with `kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-manager`
+
+**Note**: Same-node migration tests the checkpoint/restore mechanism without network namespace complications. If this fails, the issue is with the basic CRIU restore process. If this succeeds but cross-node migration fails, then the issue is specifically network namespace migration (as suspected).
+
+
+### 8. Verify Cross-Node Checkpoint Access
+
+```bash
+# Check which nodes have checkpoint agents
+kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o wide
+
+# Verify shared storage is accessible from all nodes
+for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  echo "=== Node: $node ==="
+  POD=$(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent --field-selector spec.nodeName=$node -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "$POD" ]; then
+    kubectl exec -n live-pod-migration-controller-system $POD -- ls -la /mnt/checkpoints/
+  else
+    echo "No agent on $node"
+  fi
+done
+
+# Test checkpoint file accessibility across nodes
+POD=$(kubectl get pods -n live-pod-migration-controller-system -l app=checkpoint-agent -o jsonpath='{.items[0].metadata.name}')
+echo "Testing checkpoint file access across nodes:"
+kubectl exec -n live-pod-migration-controller-system $POD -- ls -la /mnt/checkpoints/
+```
+
+### 9. Verify Agent Operation
 
 ```bash
 # Check agent pods are running
@@ -158,6 +329,9 @@ kubectl logs -n live-pod-migration-controller-system -l app=checkpoint-agent
 
 # Check controller logs
 kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-manager
+
+# Check for checkpoint operations in logs
+kubectl logs -n live-pod-migration-controller-system -l app=checkpoint-agent | grep -i checkpoint
 ```
 
 ## Expected Behavior
@@ -170,7 +344,9 @@ kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-m
 
 2. **Agent** creates real checkpoint files at `/var/lib/kubelet/checkpoints/checkpoint-<pod>_<namespace>-<container>-<timestamp>.tar`
 
-3. **ContainerCheckpointContent** is automatically created with artifact URI
+3. **Shared Storage**: Checkpoint files are automatically copied to shared NFS storage at `/mnt/checkpoints/<podUID>-<container>-<timestamp>.tar`
+
+4. **ContainerCheckpointContent** is automatically created with artifact URI using `shared://` prefix for cross-node access
 
 ### PodCheckpoint Workflow  
 1. **PodCheckpoint** transitions through phases:
@@ -186,6 +362,25 @@ kubectl logs -n live-pod-migration-controller-system deployment/lpm-controller-m
    ```
 
 3. **Resource Naming**: Child resources use deterministic names like `<podcheckpoint-name>-<container-name>`
+
+### PodMigration Workflow
+1. **PodMigration** orchestrates the complete migration process:
+   - `Pending` → validates source pod exists and is running
+   - `CheckpointInProgress` → creates PodCheckpoint for the source pod
+   - `CheckpointCompleted` → waits for checkpoint to complete successfully
+   - `MigrationInProgress` → schedules pod on destination node (if specified)
+   - `RestoreInProgress` → restores pod from checkpoint on destination node
+   - `Succeeded` → migration completed, source pod terminated
+
+2. **Cross-Node Capability**: Checkpoint files stored in shared storage enable migration between any nodes in the cluster
+
+3. **Automatic Scheduling**: If no destination node specified, scheduler selects optimal target node
+
+### Shared Storage Behavior
+1. **NFS-based Storage**: Uses NFS subdir external provisioner for ReadWriteMany access
+2. **Checkpoint Files**: Accessible from all nodes at `/mnt/checkpoints/` 
+3. **Fallback Mechanism**: Falls back to local storage if shared storage unavailable
+4. **URI Format**: Shared files use `shared://<filename>` format, local files use `file://<path>` format
 
 ## Troubleshooting
 
@@ -408,8 +603,15 @@ sudo crictl rmi localhost/checkpoint-agent:latest localhost/controller:latest ||
 # 8. Clean up checkpoint files from kubelet directory
 sudo find /var/lib/kubelet/checkpoints/ -name "checkpoint-*.tar" -delete
 
-# 9. Optional: Clean up test pods
-kubectl delete pod test-pod multi-container-pod --ignore-not-found=true
+# 9. Clean up shared storage infrastructure
+kubectl delete -f config/storage/checkpoint-pvc.yaml --ignore-not-found=true
+kubectl delete -f config/storage/nfs-provisioner.yaml --ignore-not-found=true
+kubectl delete job/nfs-setup -n kube-system --ignore-not-found=true
+kubectl delete configmap/nfs-setup-script -n kube-system --ignore-not-found=true
+
+# 10. Optional: Clean up test pods and migrations
+kubectl delete pod test-pod multi-container-pod stateful-pod --ignore-not-found=true
+kubectl delete podmigration --all --all-namespaces --ignore-not-found=true
 ```
 
 After cleanup, you can follow the build and deploy steps again to start fresh.

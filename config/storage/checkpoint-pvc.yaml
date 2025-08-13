@@ -1,0 +1,12 @@
+# Shared PVC for checkpoint storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoint-repo
+  namespace: live-pod-migration-controller-system
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: nfs-rwx
