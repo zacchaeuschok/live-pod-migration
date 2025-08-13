@@ -31,8 +31,8 @@ Vagrant.configure("2") do |config|
     master.vm.provision "shell", path: "scripts/master.sh"
   end
 
-  # Worker node
-  config.vm.define "worker" do |worker|
+  # Worker node - depends on master being up first
+  config.vm.define "worker", autostart: false do |worker|
     worker.vm.hostname = "k8s-worker"
     worker.vm.network "private_network", ip: "192.168.56.11"
     
@@ -49,15 +49,6 @@ Vagrant.configure("2") do |config|
     end
 
     worker.vm.provision "shell", path: "scripts/common.sh"
-    
-    # Join cluster if setup.sh is present
-    worker.vm.provision "shell", inline: <<-SHELL
-      if [ -f /vagrant/setup.sh ]; then
-        echo "[worker] joining the cluster..."
-        bash /vagrant/setup.sh
-      else
-        echo "[worker] /vagrant/setup.sh not found - join manually."
-      fi
-    SHELL
+    worker.vm.provision "shell", path: "scripts/worker.sh"
   end
 end

@@ -73,7 +73,7 @@ For a complete setup guide including CRIU configuration and testing instructions
 ## Documentation
 
 - **[Testing Guide](./README-TESTING.md)**: Complete setup, testing, and troubleshooting instructions
-- **[Storage Plan](./CHECKPOINT-STORAGE-PLAN.md)**: Design for shared storage implementation
+- **[Storage Plan](docs/CHECKPOINT-STORAGE-PLAN.md)**: Design for shared storage implementation
 - **API Reference**: Generated CRD documentation (see `config/crd/bases/`)
 
 ## Getting Started
