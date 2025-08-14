@@ -25,3 +25,13 @@ go.work
 *.swp
 *.swo
 *~
+
+# Vagrant files
+.vagrant/
+*.log
+private_key
+vagrant_ansible_inventory
+.vagrant.d/
+Vagrantfile.local
+.vagrant_*
+*.box
