@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: flink-wordcount
+  namespace: default
+spec:
+  containers:
+  - name: flink
+    image: flink:1.18-java11
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      # Check if we're restoring from checkpoint
+      STATE_FILE="/data/flink_state.json"
+      
+      if [ -f "$STATE_FILE" ]; then
+          echo "✅ RESTORED: Found previous Flink state!"
+          cat $STATE_FILE
+          WORDS_PROCESSED=$(cat $STATE_FILE | grep -o '"words_processed":[0-9]*' | cut -d: -f2 || echo 0)
+          echo "Continuing from: $WORDS_PROCESSED words processed"
+      else
+          WORDS_PROCESSED=0
+          echo "🚀 Starting new Flink streaming job"
+      fi
+      
+      # Start Flink standalone cluster
+      echo "Starting Flink cluster..."
+      /opt/flink/bin/start-cluster.sh
+      
+      sleep 10
+      
+      # Create a continuous streaming data generator and processor
+      echo "Starting continuous stream processing..."
+      
+      # Simulate Flink streaming word count with checkpointing
+      CHECKPOINT_COUNT=0
+      
+      while true; do
+          WORDS_PROCESSED=$((WORDS_PROCESSED + 1))
+          
+          # Simulate processing words
+          WORDS=("apache" "flink" "streaming" "processing" "analytics" "realtime" "data" "pipeline")
+          WORD=${WORDS[$((RANDOM % ${#WORDS[@]}))]}
+          
+          echo "[FLINK] Processing word: '$WORD' | Total words: $WORDS_PROCESSED | Host: $(hostname)"
+          
+          # Simulate checkpoint every 10 words
+          if [ $((WORDS_PROCESSED % 10)) -eq 0 ]; then
+              CHECKPOINT_COUNT=$((CHECKPOINT_COUNT + 1))
+              echo "📁 CHECKPOINT #$CHECKPOINT_COUNT: Saving state at $WORDS_PROCESSED words"
+              
+              # Save Flink state (this gets preserved during migration!)
+              mkdir -p /data
+              cat > $STATE_FILE << EOF
+      {
+          "words_processed": $WORDS_PROCESSED,
+          "checkpoint_count": $CHECKPOINT_COUNT,
+          "host": "$(hostname)",
+          "timestamp": "$(date)",
+          "last_word": "$WORD"
+      }
+      EOF
+          fi
+          
+          # Dashboard every 20 words
+          if [ $((WORDS_PROCESSED % 20)) -eq 0 ]; then
+              echo "📊 FLINK DASHBOARD:"
+              echo "   Words Processed: $WORDS_PROCESSED"
+              echo "   Checkpoints: $CHECKPOINT_COUNT" 
+              echo "   Processing Rate: $(echo "scale=2; $WORDS_PROCESSED / 20" | bc 2>/dev/null || echo 'N/A') words/cycle"
+              echo "   Host: $(hostname)"
+              echo "   State File Size: $(ls -lh $STATE_FILE 2>/dev/null | awk '{print $5}' || echo 'N/A')"
+              echo "================================"
+          fi
+          
+          sleep 2
+      done
+    ports:
+    - containerPort: 8081  # Flink UI
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  
+  volumes:
+  - name: data
+    emptyDir: {}
