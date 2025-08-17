@@ -21,22 +21,9 @@ fi
 
 echo "Master node is ready!"
 
-# Get join command from master
-echo "Getting join command from master..."
-JOIN_CMD=$(vagrant ssh master -c "kubeadm token create --print-join-command" 2>/dev/null)
-
-if [ -z "$JOIN_CMD" ]; then
-    echo "ERROR: Could not get join command from master"
-    exit 1
-fi
-
 # Start worker
 echo "Starting worker node..."
 vagrant up worker
-
-# Join worker to cluster
-echo "Joining worker to cluster..."
-vagrant ssh worker -c "sudo $JOIN_CMD"
 
 # Verify cluster
 echo "Verifying cluster status..."

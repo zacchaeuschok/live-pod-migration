@@ -4,6 +4,9 @@
 Vagrant.configure("2") do |config|
   config.vm.box = "bento/ubuntu-22.04"
   
+  # Configure a tmp bi-directional sync folder
+  config.vm.synced_folder ".","/tmp_sync"
+
   # Explicitly configure the /vagrant shared folder with rsync
   config.vm.synced_folder ".", "/vagrant", type: "rsync", rsync__auto: true
   

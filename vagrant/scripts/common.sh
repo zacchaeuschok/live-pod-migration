@@ -189,6 +189,6 @@ echo 'export PATH=$PATH:/home/vagrant/go/bin' >> /home/vagrant/.bashrc
 
 # Disable swap (required for Kubernetes)
 sudo swapoff -a
-sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+sudo sed -i '/\bswap\b/s/^/#/' /etc/fstab
 
 echo "Common setup completed successfully!"

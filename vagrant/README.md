@@ -21,12 +21,9 @@ This directory contains a simplified Vagrant setup for testing the live pod migr
 # From the vagrant directory
 cd vagrant/
 
-# Start both nodes (master first, then worker)
-vagrant up master
-vagrant up worker
+# Run setup cluster script (this will first bring up master then worker)
+./setup-cluster.sh
 
-# Or start both at once
-vagrant up
 ```
 
 ### 2. Verify Cluster
@@ -51,9 +48,9 @@ kubectl get service nginx
 cd /home/vagrant/live-pod-migration-controller
 
 # Build and deploy the controller
-make docker-build IMG=controller:latest
-make docker-build-agent AGENT_IMG=checkpoint-agent:latest
-make deploy IMG=controller:latest
+sudo make docker-build IMG=controller:latest CONTAINER_TOOL=buildah
+sudo make docker-build-agent AGENT_IMG=checkpoint-agent:latest CONTAINER_TOOL=buildah
+sudo make deploy IMG=controller:latest
 
 # Verify deployment
 kubectl get pods -n live-pod-migration-controller-system
