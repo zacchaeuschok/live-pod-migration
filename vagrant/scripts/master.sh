@@ -21,10 +21,14 @@ nodeRegistration:
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
+controlPlaneEndpoint: 192.168.56.10:6443
 networking:
   podSubnet: 10.244.0.0/16
 apiServer:
   advertiseAddress: 192.168.56.10
+  certSANs:
+    - 192.168.56.10
+    - 10.0.2.15
 EOF
 
 # Reset any previous failed installations
@@ -87,6 +91,8 @@ echo "Removing control-plane taint..."
 kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
 
 # Note: Join command will be retrieved directly by worker when needed
+kubeadm token create --print-join-command > /tmp_sync/setup.sh
+chmod +x /tmp_sync/setup.sh
 echo "Master ready for worker nodes to join..."
 
 # Set up Go tools for development
