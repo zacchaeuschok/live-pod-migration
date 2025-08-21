@@ -1,0 +1,229 @@
+---
+- name: Kubernetes Master Node Setup
+  hosts: master
+  become: true
+  vars:
+    k8s_version: "1.30"
+    cri_socket: "unix:///var/run/crio/crio.sock"
+    pod_subnet: "10.244.0.0/16"
+    vagrant_user: "vagrant"
+    join_script_path: /tmp_sync/setup.sh
+
+  tasks:
+    - name: Ensure CRI-O and kubelet services are running
+      block:
+        - name: Ensure CRI-O is running
+          systemd:
+            name: crio
+            state: started
+            enabled: yes
+
+        - name: Ensure kubelet is running
+          systemd:
+            name: kubelet
+            state: started
+            enabled: yes
+
+    - name: Setup Kubernetes Control-Plane
+      block:
+        - name: Create kubeadm config file
+          copy:
+            dest: /tmp/kubeadm-config.yaml
+            content: |
+              apiVersion: kubeadm.k8s.io/v1beta3
+              kind: InitConfiguration
+              nodeRegistration:
+                criSocket: {{ cri_socket }}
+              ---
+              apiVersion: kubeadm.k8s.io/v1beta3
+              kind: ClusterConfiguration
+              controlPlaneEndpoint: {{ ansible_eth1.ipv4.address }}:6443
+              networking:
+                podSubnet: {{ pod_subnet }}
+              apiServer:
+                advertiseAddress: {{ ansible_eth1.ipv4.address }}
+                certSANs:
+                  - {{ ansible_eth1.ipv4.address }}
+          register: kubeadm_config
+
+        - name: Reset any previous kubeadm installations
+          command: kubeadm reset -f
+          ignore_errors: true
+          when: kubeadm_config.changed
+
+        - name: Initialize Kubernetes Control-Plane
+          command: kubeadm init --config=/tmp/kubeadm-config.yaml
+          args:
+            creates: /etc/kubernetes/admin.conf
+
+    - name: Configure kubeconfig for users
+      block:
+        - name: Ensure .kube directory exists for vagrant user
+          file:
+            path: /home/{{ vagrant_user }}/.kube
+            state: directory
+            owner: "{{ vagrant_user }}"
+            group: "{{ vagrant_user }}"
+            mode: "0700"
+
+        - name: Set up kubeconfig for vagrant user
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /home/{{ vagrant_user }}/.kube/config
+            owner: "{{ vagrant_user }}"
+            group: "{{ vagrant_user }}"
+            mode: "0600"
+            remote_src: yes
+
+        - name: Ensure .kube directory exists for root
+          file:
+            path: /root/.kube
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Set up kubeconfig for root
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            owner: root
+            group: root
+            mode: "0600"
+            remote_src: yes
+
+        - name: Verify kubectl client works
+          command: kubectl version --client
+          changed_when: false
+
+        - name: Verify connection to API server
+          command: kubectl get nodes
+          changed_when: false
+
+    - name: Install Flannel CNI networking
+      block:
+        - name: Apply Flannel manifest
+          command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+    - name: Enable ContainerCheckpoint feature gate in kubelet
+      block:
+        - name: Backup kubelet config
+          copy:
+            src: /var/lib/kubelet/config.yaml
+            dest: /var/lib/kubelet/config.yaml.backup
+            remote_src: yes
+            backup: yes
+
+        - name: Ensure featureGates exists
+          lineinfile:
+            path: /var/lib/kubelet/config.yaml
+            line: "featureGates:"
+            state: present
+
+        - name: Enable ContainerCheckpoint
+          lineinfile:
+            path: /var/lib/kubelet/config.yaml
+            insertafter: "^featureGates:"
+            regexp: "^  ContainerCheckpoint:.*"
+            line: "  ContainerCheckpoint: true"
+
+        - name: Restart kubelet
+          systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: yes
+
+        - name: Verify ContainerCheckpoint feature is enabled
+          shell: |
+            kubectl get --raw /metrics | grep kubernetes_feature_enabled | grep ContainerCheckpoint
+          register: checkpoint_feature
+          changed_when: false
+          failed_when: checkpoint_feature.rc != 0
+
+    - name: Prepare worker node join command
+      block:
+        - name: Wait for all nodes to be Ready
+          shell: kubectl wait --for=condition=Ready nodes --all --timeout=300s
+          changed_when: false
+
+        - name: Remove control-plane taint to allow scheduling on master
+          shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+          changed_when: false
+          ignore_errors: true
+
+        - name: Generate kubeadm join command for workers
+          shell: kubeadm token create --print-join-command
+          register: join_command
+          changed_when: false
+
+        - name: Write kubeadm join command to shared folder
+          copy:
+            content: "{{ join_command.stdout }}"
+            dest: "{{ join_script_path }}"
+            mode: "0755"
+
+    - name: Set up NFS server for checkpoint storage
+      block:
+        - name: Install NFS server
+          apt:
+            name: nfs-kernel-server
+            state: present
+            update_cache: yes
+
+        - name: Create shared directory
+          file:
+            path: /var/nfs/checkpoint-storage
+            state: directory
+            owner: nobody
+            group: nogroup
+            mode: "0777"
+
+        - name: Configure exports
+          lineinfile:
+            path: /etc/exports
+            line: "/var/nfs/checkpoint-storage *(rw,sync,no_subtree_check,no_root_squash)"
+            create: yes
+
+        - name: Start and enable NFS server
+          systemd:
+            name: nfs-kernel-server
+            state: restarted
+            enabled: yes
+
+        - name: Check exported NFS shares
+          command: exportfs -v
+          register: nfs_exports
+          changed_when: false
+          failed_when: "'/var/nfs/checkpoint-storage' not in nfs_exports.stdout"
+
+    - name: Install Go controller tools
+      block:
+        - name: Install Go controller tools
+          environment:
+            GOPATH: "/home/{{ vagrant_user }}/go"
+            PATH: "/home/{{ vagrant_user }}/go/bin:/usr/local/go/bin:{{ ansible_env.PATH }}"
+          shell: |
+            cd $HOME/live-pod-migration-controller
+            rm -f bin/controller-gen*
+
+            go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.0
+            go install sigs.k8s.io/kustomize/kustomize/v5@latest
+
+            mkdir -p bin
+
+            cp $(go env GOPATH)/bin/controller-gen bin/
+            cp $(go env GOPATH)/bin/kustomize bin/
+
+    - name: Verify runc and CRIU
+      block:
+        - name: Check runc checkpoint support
+          shell: /usr/sbin/runc --help | grep -q "checkpoint.*checkpoint a running container"
+          register: runc_check
+          changed_when: false
+          failed_when: runc_check.rc != 0
+
+        - name: Check CRIU functionality
+          command: criu check
+          register: criu_check
+          changed_when: false
+          failed_when: criu_check.rc != 0

@@ -30,12 +30,17 @@ Vagrant.configure("2") do |config|
       prl.name = "k8s-master"
     end
 
-    master.vm.provision "shell", path: "scripts/common.sh"
-    master.vm.provision "shell", path: "scripts/master.sh"
+    master.vm.provision "ansible_local" do |ansible|
+      ansible.playbook = "playbooks/common.yml"
+    end
+    
+    master.vm.provision "ansible_local" do |ansible|
+      ansible.playbook = "playbooks/master.yml"
+    end
   end
 
   # Worker node - depends on master being up first
-  config.vm.define "worker", autostart: false do |worker|
+  config.vm.define "worker" do |worker|
     worker.vm.hostname = "k8s-worker"
     worker.vm.network "private_network", ip: "192.168.56.11"
     
@@ -51,7 +56,13 @@ Vagrant.configure("2") do |config|
       prl.name = "k8s-worker"
     end
 
-    worker.vm.provision "shell", path: "scripts/common.sh"
-    worker.vm.provision "shell", path: "scripts/worker.sh"
+    worker.vm.provision "ansible_local" do |ansible|
+      ansible.playbook = "playbooks/common.yml"
+    end
+
+    worker.vm.provision "ansible_local" do |ansible|
+      ansible.playbook = "playbooks/worker.yml"
+    end
   end
+
 end

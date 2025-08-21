@@ -1,0 +1,315 @@
+- name: Kubernetes Node Setup with CRI-O and Tools
+  hosts: all
+  become: true
+  vars:
+    k8s_version: "1.30"
+    crio_version: "1.30"
+    go_version_runc: "1.22.2"
+    go_version_controller: "1.21.5"
+    vagrant_user: "vagrant"
+
+  tasks:
+    - name: Update and install prereqs
+      block:
+        - name: Update apt cache and upgrade packages
+          apt:
+            update_cache: yes
+            upgrade: dist
+
+        - name: Install essential packages
+          apt:
+            name:
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - gnupg
+              - lsb-release
+
+    - name: Configure kernel modules and sysctl for Kubernetes
+      block:
+        - name: Add Kubernetes kernel modules to config file
+          blockinfile:
+            path: /etc/modules-load.d/k8s.conf
+            block: |
+              overlay
+              br_netfilter
+            create: yes
+
+        - name: Load kernel modules immediately
+          command: modprobe {{ item }}
+          loop:
+            - overlay
+            - br_netfilter
+          changed_when: false
+
+        - name: Set sysctl parameters for Kubernetes networking
+          blockinfile:
+            path: /etc/sysctl.d/k8s.conf
+            block: |
+              net.bridge.bridge-nf-call-iptables  = 1
+              net.bridge.bridge-nf-call-ip6tables = 1
+              net.ipv4.ip_forward                 = 1
+            create: yes
+
+        - name: Apply sysctl settings
+          command: sysctl --system
+          changed_when: false
+
+    - name: Install and configure CRI-O
+      block:
+        - name: Ensure directories exist
+          file:
+            path: "{{ item }}"
+            state: directory
+          loop:
+            - /etc/crio
+            - /etc/containers
+
+        - name: Add CRI-O apt repository
+          apt_repository:
+            repo: "deb [trusted=yes] https://pkgs.k8s.io/addons:/cri-o:/stable:/v{{ crio_version }}/deb/ /"
+            filename: cri-o
+            update_cache: yes
+
+        - name: Install CRI-O
+          apt:
+            name: cri-o
+
+        - name: Generate CRI-O configuration
+          command: crio config
+          register: crio_conf
+
+        - name: Write CRI-O config
+          copy:
+            dest: /etc/crio/crio.conf
+            content: "{{ crio_conf.stdout }}"
+
+        - name: Enable CRIU support in CRI-O
+          lineinfile:
+            path: /etc/crio/crio.conf
+            regexp: "^# enable_criu_support = .*"
+            line: "enable_criu_support = true"
+
+        - name: Set CRI-O default runtime to runc
+          lineinfile:
+            path: /etc/crio/crio.conf
+            regexp: "default_runtime = .*"
+            line: 'default_runtime = "runc"'
+
+        - name: Set CRI-O runtime path
+          lineinfile:
+            path: /etc/crio/crio.conf
+            regexp: "runtime_path = .*"
+            line: 'runtime_path = "/usr/sbin/runc"'
+
+        - name: Configure container registries
+          lineinfile:
+            path: /etc/containers/registries.conf
+            line: unqualified-search-registries = ["docker.io", "quay.io", "gcr.io", "registry.k8s.io"]
+            create: yes
+
+        - name: Configure container policy.json
+          blockinfile:
+            path: /etc/containers/policy.json
+            block: |
+              {
+                  "default": [{"type": "insecureAcceptAnything"}],
+                  "transports": {
+                      "docker-daemon": {
+                          "": [{"type":"insecureAcceptAnything"}]
+                      }
+                  }
+              }
+            create: yes
+
+        - name: Reload systemd and start CRI-O
+          systemd:
+            daemon_reload: yes
+            name: crio
+            enabled: yes
+            state: restarted
+
+    - name: Install Kubernetes components
+      block:
+        - name: Ensure apt keyrings directory exists
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+
+        - name: Download Kubernetes GPG key
+          get_url:
+            url: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key"
+            dest: /etc/apt/keyrings/kubernetes.key
+
+        - name: Convert key to .gpg format
+          command: gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /etc/apt/keyrings/kubernetes.key
+          args:
+            creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+        - name: Add Kubernetes apt repository
+          apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
+            filename: kubernetes
+            update_cache: yes
+
+        - name: Install Kubernetes packages
+          apt:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+
+        - name: Hold Kubernetes packages
+          command: "apt-mark hold kubelet kubeadm kubectl"
+
+    - name: Install tools, configure kubelet, and disable swap
+      block:
+        - name: Install utilities and buildah
+          apt:
+            name:
+              - buildah
+              - git
+              - make
+              - wget
+              - curl
+              - tree
+              - jq
+              - criu
+              - nfs-common
+              - build-essential
+              - libseccomp-dev
+              - pkg-config
+              - runc
+
+        - name: Configure kubelet node ip
+          lineinfile:
+            path: /etc/default/kubelet
+            line: KUBELET_EXTRA_ARGS=--node-ip={{ ansible_eth1.ipv4.address }}
+
+        - name: Ensure directory for kubelet service exists
+          file:
+            path: /etc/systemd/system/kubelet.service.d
+            state: directory
+
+        - name: Configure kubelet to use CRI-O
+          copy:
+            dest: /etc/systemd/system/kubelet.service.d/10-crio.conf
+            content: |
+              [Service]
+              Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/crio/crio.sock"
+
+        - name: Reload systemd and enable kubelet
+          systemd:
+            daemon_reload: yes
+            name: kubelet
+            enabled: yes
+            state: started
+
+        - name: Remove swapfile from /etc/fstab
+          mount:
+            name: "{{ item }}"
+            fstype: swap
+            state: absent
+          with_items:
+            - swap
+            - none
+
+        - name: Disable swap
+          command: swapoff -a
+          when: ansible_swaptotal_mb > 0
+
+    - name: Install Go for runc
+      block:
+        - name: Determine system architecture
+          command: dpkg --print-architecture
+          register: system_arch
+          changed_when: false
+
+        - name: Check Vagrant user's Go version
+          command: /home/{{ vagrant_user }}/.go/bin/go version
+          register: vagrant_user_go_version
+          ignore_errors: true
+          changed_when: false
+
+        - name: Remove Vagrant user's Go directory if version mismatch
+          file:
+            path: /home/{{ vagrant_user }}/.go
+            state: absent
+          when: "'go' + go_version_runc not in vagrant_user_go_version.stdout"
+
+        - name: Ensure Go directory exists for Vagrant user
+          file:
+            path: /home/{{ vagrant_user }}/.go
+            state: directory
+          become_user: "{{ vagrant_user }}"
+
+        - name: Install Go for runc build
+          unarchive:
+            src: "https://go.dev/dl/go{{ go_version_runc }}.linux-{{ system_arch.stdout }}.tar.gz"
+            dest: /home/{{ vagrant_user }}/.go
+            remote_src: yes
+            extra_opts: [--strip-components=1]
+            # This prevents reinstallation if Go binary exists
+            creates: /home/{{ vagrant_user }}/.go/bin/go
+          become_user: "{{ vagrant_user }}"
+
+        - name: Build runc with CRIU support
+          shell: |
+            cd /tmp
+            git clone https://github.com/opencontainers/runc.git
+            cd runc
+            git checkout v1.2.5
+            sed -i '/toolchain/d' go.mod
+            /home/{{ vagrant_user }}/.go/bin/go build -trimpath -buildmode=pie -tags "seccomp apparmor selinux criu" \
+              -ldflags "-X main.gitCommit=v1.2.5-criu -X main.version=1.2.5" -o runc .
+            sudo cp runc /usr/sbin/runc
+            sudo chmod +x /usr/sbin/runc
+          args:
+            creates: /usr/sbin/runc
+
+        - name: Fix CRI-O drop-in config to use runc
+          lineinfile:
+            path: /etc/crio/crio.conf.d/10-crio.conf
+            regexp: "^default_runtime =.*"
+            line: 'default_runtime = "runc"'
+
+        - name: Fix CRI-O runtime path
+          lineinfile:
+            path: /etc/crio/crio.conf.d/10-crio.conf
+            regexp: "^runtime_path =.*"
+            line: 'runtime_path = "/usr/sbin/runc"'
+
+        - name: Restart CRI-O
+          systemd:
+            name: crio
+            state: restarted
+
+    - name: Install Go for Controller
+      block:
+        - name: Check local Go version
+          command: /usr/local/go/bin/go version
+          register: local_go_version
+          ignore_errors: true
+          changed_when: false
+
+        - name: Remove Vagrant user's Go directory if version mismatch
+          file:
+            path: /usr/local/go
+            state: absent
+          when: "'go' + go_version_controller not in local_go_version.stdout"
+
+        - name: Install Go for controller
+          unarchive:
+            src: "https://go.dev/dl/go{{ go_version_controller }}.linux-{{ system_arch.stdout }}.tar.gz"
+            dest: /usr/local
+            remote_src: yes
+            # This prevents reinstallation if Go binary exists
+            creates: /usr/local/go/bin
+
+        - name: Set Go path for vagrant user
+          blockinfile:
+            path: /home/{{ vagrant_user }}/.bashrc
+            block: |
+              export GOPATH=$HOME/go
+              export PATH=$PATH:$GOPATH/bin:/usr/local/go/bin
+            create: yes

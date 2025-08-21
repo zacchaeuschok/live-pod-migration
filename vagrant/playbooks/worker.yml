@@ -1,0 +1,25 @@
+- name: Kurbenetes Worker Node Setup
+  hosts: worker
+  become: true
+  vars:
+    join_script_path: /tmp_sync/setup.sh
+
+  tasks:
+    - name: Check if join script exists
+      stat:
+        path: "{{ join_script_path }}"
+      register: join_script
+    
+    - name: Reset worker node if already joined
+      command: kubeadm reset -f
+      when: join_script.stat.exists
+
+    - name: Run join script
+      command: bash "{{ join_script_path }}"
+      when: join_script.stat.exists
+
+    - name: Remove join script after running
+      file:
+        path: "{{ join_script_path }}"
+        state: absent
+      when: join_script.stat.exists
