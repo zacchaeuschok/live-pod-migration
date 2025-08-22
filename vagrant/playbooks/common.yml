@@ -14,7 +14,7 @@
         - name: Update apt cache and upgrade packages
           apt:
             update_cache: yes
-            upgrade: dist
+            upgrade: yes
 
         - name: Install essential packages
           apt:
@@ -109,9 +109,9 @@
             create: yes
 
         - name: Configure container policy.json
-          blockinfile:
-            path: /etc/containers/policy.json
-            block: |
+          copy:
+            dest: /etc/containers/policy.json
+            content: |
               {
                   "default": [{"type": "insecureAcceptAnything"}],
                   "transports": {
@@ -120,7 +120,6 @@
                       }
                   }
               }
-            create: yes
 
         - name: Reload systemd and start CRI-O
           systemd:
@@ -313,3 +312,4 @@
               export GOPATH=$HOME/go
               export PATH=$PATH:$GOPATH/bin:/usr/local/go/bin
             create: yes
+          become_user: "{{ vagrant_user }}"

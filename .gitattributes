@@ -1,0 +1,2 @@
+# # Ensure .sh always uses LF line endings because it will run in a Linux VM
+deploy-shared-storage.sh text eol=lf

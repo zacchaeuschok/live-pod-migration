@@ -32,6 +32,9 @@
             content: |
               apiVersion: kubeadm.k8s.io/v1beta3
               kind: InitConfiguration
+              localAPIEndpoint:
+                advertiseAddress: {{ ansible_eth1.ipv4.address }}
+                bindPort: 6443
               nodeRegistration:
                 criSocket: {{ cri_socket }}
               ---
@@ -41,7 +44,6 @@
               networking:
                 podSubnet: {{ pod_subnet }}
               apiServer:
-                advertiseAddress: {{ ansible_eth1.ipv4.address }}
                 certSANs:
                   - {{ ansible_eth1.ipv4.address }}
           register: kubeadm_config
@@ -53,8 +55,7 @@
 
         - name: Initialize Kubernetes Control-Plane
           command: kubeadm init --config=/tmp/kubeadm-config.yaml
-          args:
-            creates: /etc/kubernetes/admin.conf
+          when: kubeadm_config.changed
 
     - name: Configure kubeconfig for users
       block:
@@ -208,11 +209,7 @@
 
             go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.0
             go install sigs.k8s.io/kustomize/kustomize/v5@latest
-
-            mkdir -p bin
-
-            cp $(go env GOPATH)/bin/controller-gen bin/
-            cp $(go env GOPATH)/bin/kustomize bin/
+      become_user: "{{ vagrant_user }}"
 
     - name: Verify runc and CRIU
       block:

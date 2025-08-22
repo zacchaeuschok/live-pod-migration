@@ -9,7 +9,7 @@
       stat:
         path: "{{ join_script_path }}"
       register: join_script
-    
+
     - name: Reset worker node if already joined
       command: kubeadm reset -f
       when: join_script.stat.exists
